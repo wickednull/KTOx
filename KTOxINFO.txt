@@ -1,0 +1,31 @@
+KTOx v5.0
+Advanced ARP Network Control & Tactical Interception Suite
+Author: Nikolas DeRuise (Null_Lyfe)
+Date: March 2026
+Classification: TIER 1 RED/BLUE TEAM UTILITY
+1. Executive Summary
+KTOx v5.0 is an integrated Address Resolution Protocol (ARP) manipulation framework designed for high-stakes network auditing and security research. Unlike legacy CLI-only tools, KTOx provides a surgical, real-time graphical interface built on a high-concurrency Python engine. It bridges the gap between offensive exploitation and defensive hardening, allowing operators to manipulate, monitor, and secure Layer 2 traffic within a unified environment.
+2. Technical Architecture
+The suite is built using a decoupled architecture to ensure stability on low-power hardware (e.g., Raspberry Pi 5) while maintaining a modern "DarkSec" UI.
+ * Core Engine: Utilizes a multi-threaded Scapy implementation for packet crafting and an Nmap integration for host discovery.
+ * UI Framework: Developed with CustomTkinter for high-DPI scaling and hardware-accelerated rendering.
+ * Dependency Management: Features a "Dynamic Venv Injection" system to bypass sudo path stripping—critical for professional deployments where system Python is restricted.
+3. Offensive Capabilities (Red Team)
+KTOx v5.0 introduces proprietary logic for granular network control:
+3.1 The ARP Cage (Peer Isolation)
+While traditional spoofing targets the Gateway, the ARP Cage isolates a target from every discovered host on the subnet. By poisoning the ARP cache of all local peers, KTOx forces the target into a "black hole," preventing lateral movement and internal communication without dropping the target's physical link.
+3.2 Advanced Storm & Flood Vectors
+ * ARP Reply Storm: Broadcasts high-frequency unsolicited ARP replies to destabilize switch CAM tables.
+ * Gateway DoS: Specifically targets the upstream router to reroute or drop all North-South traffic for a specific target.
+4. Defensive Capabilities (Blue Team)
+KTOx serves as a "Purple Team" tool by providing immediate remediation and monitoring:
+4.1 Rogue Device Detector
+By establishing a cryptographically-backed baseline of the network, KTOx polls the environment at 30-second intervals. Any new MAC address not present in the verified baseline triggers an immediate visual and logged alert, identifying the vendor via an internal OUI database.
+4.2 Static ARP Hardening
+The Auto-Harden module generates and applies a static mapping for all known hosts. This "locks" the ARP table at the OS level, rendering standard poisoning attacks ineffective against the monitoring station.
+5. Operational Safety & "Clean Exit"
+A Tier 1 tool must prioritize network stability. KTOx includes an Automated Restoral Thread:
+ * Upon attack termination or GUI closure, the suite initiates a high-velocity Re-ARP sequence.
+ * It sends valid Gateway-to-Target and Target-to-Gateway packets to "heal" the poisoned caches, ensuring no residual downtime occurs after the engagement ends.
+6. Conclusion
+KTOx v5.0 represents the next evolution in tactical network tools. By combining a gritty, efficient interface with stable, professional-grade restoral logic, it provides security researchers with the control necessary for modern internal audits.
