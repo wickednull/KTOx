@@ -15,10 +15,26 @@
 #   hostapd + dnsmasq:  sudo apt install hostapd dnsmasq
 #   Python:             scapy (Dot11 layers)
 
-import os, sys, re, time, json, subprocess, threading, shutil, signal, logging
+import os, sys, re, time, json, subprocess, threading, shutil, signal, logging, atexit
 from datetime import datetime
 
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+
+
+def _emergency_restore():
+    """
+    Last-resort safety net — called by atexit if the process exits
+    while monitor mode is still active. Prevents leaving wlan0 broken.
+    """
+    try:
+        if MonitorMode._active:
+            import sys
+            print("\n[ktox_wifi] Emergency: restoring monitor mode interfaces...",
+                  file=sys.stderr)
+            MonitorMode.disable_all()
+    except: pass
+
+atexit.register(_emergency_restore)
 
 try:
     from rich.console  import Console
@@ -128,61 +144,150 @@ class MonitorMode:
     Enable/disable monitor mode on a wireless interface.
     Uses airmon-ng if available, falls back to iw/ip commands.
     Tracks the monitor interface name (may change e.g. wlan0 → wlan0mon).
+
+    ALWAYS call disable() when done — restores NetworkManager and managed mode.
     """
 
+    # Class-level registry so disable() can find the right instance
+    # even if the caller lost the original object reference
+    _active = {}   # original_iface → MonitorMode instance
+
     def __init__(self, iface):
-        self.iface      = iface
-        self.mon_iface  = None
-        self._original  = iface
+        self.iface     = iface
+        self.mon_iface = None          # set after enable()
+        self._original = iface
+        self._nm_killed = False        # did we kill NetworkManager?
+
+    def _get_current_mode(self):
+        """Return current type of interface (managed/monitor/etc)."""
+        result = _run(["iw", self.iface, "info"])
+        m = re.search(r'type\s+(\S+)', result.stdout)
+        return m.group(1) if m else "unknown"
+
+    def _resolve_mon_iface(self):
+        """
+        After airmon-ng start, find which interface is now in monitor mode.
+        airmon-ng may rename wlan0 → wlan0mon, or may keep the same name.
+        """
+        # Check common renamed forms first
+        for candidate in [
+            self.iface + "mon",   # wlan0mon
+            self.iface,           # wlan0 (some drivers keep the name)
+        ]:
+            result = _run(["iw", candidate, "info"])
+            if result.returncode == 0:
+                if "monitor" in result.stdout:
+                    return candidate
+        # Fallback: scan all wireless interfaces for one in monitor mode
+        result = _run(["iw", "dev"])
+        current_iface = None
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("Interface"):
+                current_iface = line.split()[1]
+            if line.startswith("type monitor") and current_iface:
+                return current_iface
+        return self.iface  # best guess
 
     def enable(self):
-        """Put interface into monitor mode."""
+        """
+        Put interface into monitor mode.
+        Returns the monitor interface name (may differ from self.iface).
+        """
         tools = _check_tools()
 
+        # Already in monitor mode?
+        if self._get_current_mode() == "monitor":
+            self.mon_iface = self.iface
+            warn(f"{self.iface} is already in monitor mode.")
+            MonitorMode._active[self._original] = self
+            return self.mon_iface
+
         if tools["airmon-ng"]:
-            # Kill interfering processes first
-            _run(["airmon-ng", "check", "kill"])
+            # airmon-ng check kill stops NetworkManager/wpa_supplicant
+            # Record that we did this so disable() can restart them
+            info("Stopping NetworkManager/wpa_supplicant via airmon-ng...")
+            kill_result = _run(["airmon-ng", "check", "kill"])
+            self._nm_killed = True
+
             result = _run(["airmon-ng", "start", self.iface])
             if result.returncode == 0:
-                # airmon-ng may rename the interface
-                m = re.search(r'monitor mode (?:vif )?enabled (?:on|for) (\S+)', result.stdout)
-                if m:
-                    self.mon_iface = m.group(1).strip("[])(")
-                else:
-                    # Common naming patterns
-                    for candidate in [self.iface + "mon", self.iface]:
-                        check = _run(["iw", candidate, "info"])
-                        if check.returncode == 0:
-                            self.mon_iface = candidate
-                            break
-                ok(f"Monitor mode enabled → {self.mon_iface or self.iface}")
+                self.mon_iface = self._resolve_mon_iface()
+                ok(f"Monitor mode enabled → {self.mon_iface}")
                 _loot("MONITOR_ENABLE", {"iface": self.iface, "mon": self.mon_iface})
-                return self.mon_iface or self.iface
+                MonitorMode._active[self._original] = self
+                return self.mon_iface
+            else:
+                err(f"airmon-ng failed: {result.stderr.strip() or result.stdout.strip()}")
+                # Fall through to iw method
 
-        # Fallback: iw / ip
+        # Fallback: iw set type monitor (correct command)
+        info(f"Using iw fallback for monitor mode on {self.iface}...")
         _run(["ip", "link", "set", self.iface, "down"])
-        _run(["iw", self.iface, "set", "monitor", "none"])
+        r = _run(["iw", self.iface, "set", "type", "monitor"])   # FIX: was "monitor none"
+        if r.returncode != 0:
+            err(f"iw set type monitor failed: {r.stderr.strip()}")
+            # Bring interface back up regardless
+            _run(["ip", "link", "set", self.iface, "up"])
+            return self.iface
         _run(["ip", "link", "set", self.iface, "up"])
         self.mon_iface = self.iface
-        ok(f"Monitor mode enabled (iw fallback) → {self.mon_iface}")
+        ok(f"Monitor mode enabled (iw) → {self.mon_iface}")
         _loot("MONITOR_ENABLE", {"iface": self.iface, "mon": self.mon_iface})
+        MonitorMode._active[self._original] = self
         return self.mon_iface
 
     def disable(self):
-        """Restore managed mode."""
+        """
+        Restore managed mode and restart NetworkManager if we killed it.
+        ALWAYS call this when done with WiFi attacks.
+        """
         tools = _check_tools()
         iface = self.mon_iface or self.iface
 
         if tools["airmon-ng"]:
-            _run(["airmon-ng", "stop", iface])
-            ok(f"Monitor mode disabled → {self._original}")
+            result = _run(["airmon-ng", "stop", iface])
+            if result.returncode != 0:
+                warn(f"airmon-ng stop failed, trying iw directly...")
+                self._iw_restore(iface)
         else:
-            _run(["ip", "link", "set", iface, "down"])
-            _run(["iw", iface, "set", "type", "managed"])
-            _run(["ip", "link", "set", iface, "up"])
-            ok(f"Managed mode restored → {iface}")
+            self._iw_restore(iface)
 
-        _loot("MONITOR_DISABLE", {"iface": iface})
+        # Restart NetworkManager if we killed it
+        if self._nm_killed:
+            info("Restarting NetworkManager...")
+            nm_result = _run(["systemctl", "start", "NetworkManager"])
+            if nm_result.returncode == 0:
+                ok("NetworkManager restarted.")
+            else:
+                # Try service command as fallback
+                _run(["service", "network-manager", "start"])
+                warn("Check NetworkManager status if WiFi doesn't reconnect.")
+            self._nm_killed = False
+
+        # Remove from active registry
+        MonitorMode._active.pop(self._original, None)
+        ok(f"Managed mode restored → {self._original}")
+        _loot("MONITOR_DISABLE", {"iface": iface, "restored": self._original})
+
+    def _iw_restore(self, iface):
+        """Restore managed mode using iw directly."""
+        _run(["ip", "link", "set", iface, "down"])
+        r = _run(["iw", iface, "set", "type", "managed"])
+        if r.returncode != 0:
+            # Interface may have been renamed back already
+            _run(["iw", self._original, "set", "type", "managed"])
+        _run(["ip", "link", "set", self._original, "up"])
+
+    @classmethod
+    def disable_all(cls):
+        """Emergency restore — disable all active monitor mode instances."""
+        for iface, instance in list(cls._active.items()):
+            try:
+                instance.disable()
+            except Exception as e:
+                warn(f"Failed to restore {iface}: {e}")
+        cls._active.clear()
 
     def set_channel(self, channel):
         """Set WiFi channel on monitor interface."""
@@ -997,7 +1102,9 @@ def wifi_menu():
             if choice == "1":
                 mon = MonitorMode(iface)
                 mon_iface = mon.enable()
+                # Instance stored in MonitorMode._active registry for safe restore
                 ok(f"Monitor interface: {mon_iface}")
+                info("Use option [7] to restore managed mode when done.")
 
             elif choice == "2":
                 duration = int(Prompt.ask(
@@ -1052,9 +1159,16 @@ def wifi_menu():
                 ap.start()
 
             elif choice == "7":
-                mon = MonitorMode(iface)
-                mon.mon_iface = iface
-                mon.disable()
+                # Use class registry for safe restore
+                if MonitorMode._active:
+                    MonitorMode.disable_all()
+                else:
+                    warn(f"No tracked monitor instance. Attempting direct restore of {iface}...")
+                    mon = MonitorMode(iface)
+                    mon.mon_iface = iface
+                    mon._iw_restore(iface)
+                    _run(["systemctl", "start", "NetworkManager"])
+                    ok("Attempted restore — verify with: iw dev")
 
             else:
                 console.print(f"  [{C_ORANGE}]Invalid option.[/{C_ORANGE}]")
@@ -1062,6 +1176,10 @@ def wifi_menu():
         except KeyboardInterrupt:
             stop_flag.set()
             console.print(f"\n  [{C_ORANGE}]Interrupted.[/{C_ORANGE}]")
+            # Always restore monitor mode on Ctrl+C
+            if MonitorMode._active:
+                warn("Restoring monitor mode interfaces...")
+                MonitorMode.disable_all()
             stop_flag.clear()
         except Exception as ex:
             err(f"Error: {ex}")
