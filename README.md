@@ -71,7 +71,7 @@ sudo ./venv/bin/python3 ktox.py --gui
 
 ```
 KTOx/
-├── ktox.py             ← Entry point + full CLI TUI (all 35+ modules)
+├── ktox.py             ← Entry point + full CLI TUI (all 50+ modules)
 ├── ktox_gui.py         ← CustomTkinter adaptive GUI
 ├── ktox_mitm.py        ← MITM engine: DNS/DHCP spoof, SSL strip, captive portal
 ├── ktox_advanced.py    ← JS injector, multi-protocol sniffer, PCAP, NTLMv2, session hijack, caplets
