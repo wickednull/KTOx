@@ -140,41 +140,18 @@ def _get_wireless_interfaces():
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MonitorMode:
-    """
-    Enable/disable monitor mode on a wireless interface.
+    """Enable/disable monitor mode. Uses airmon-ng exactly like wifite does."""
 
-    Handles three driver families correctly:
-
-    1. brcmfmac + Nexmon (Raspberry Pi onboard WiFi)
-       - MUST stop NetworkManager and wpa_supplicant FIRST
-       - MUST bring wlan0 DOWN before adding monitor vif
-       - MUST delete any stale wlan0mon vif before adding new one
-       - brcmfmac only allows ONE monitor vif at a time (-95 EOPNOTSUPP otherwise)
-       - Power management must be off or firmware crashes
-       - airmon-ng works BUT only after the above steps
-
-    2. mac80211 drivers (Atheros, Ralink, Intel, most USB adapters)
-       - airmon-ng handles everything automatically
-       - iw phy phyX interface add wlan0mon type monitor as fallback
-
-    3. Generic iw fallback
-       - ip link down → iw set type monitor → ip link up
-    """
-
-    _active = {}  # class registry: original_iface → MonitorMode instance
+    _active = {}  # registry: original_iface -> instance
 
     def __init__(self, iface):
-        self.iface      = iface
-        self._original  = iface
-        self.mon_iface  = None
+        self.iface     = iface
+        self._original = iface
+        self.mon_iface = None
+        self._phy      = None
         self._nm_killed = False
-        self._phy       = None
-        self._driver    = None   # detected driver name
-
-    # ── Helpers ────────────────────────────────────────────────────────────
 
     def _get_phy(self, iface=None):
-        """Get the PHY name (phy0) for an interface."""
         target = iface or self.iface
         result = _run(["iw", "dev"])
         current_phy = None
@@ -188,13 +165,11 @@ class MonitorMode:
         return None
 
     def _get_mode(self, iface=None):
-        """Return current type of interface: managed/monitor/unknown."""
         target = iface or self.iface
         result = _run(["iw", "dev", target, "info"])
         if result.returncode == 0:
-            m = re.search(r'^\s+type\s+(\S+)', result.stdout, re.M)
+            m = re.search(r"^\s+type\s+(\S+)", result.stdout, re.M)
             return m.group(1) if m else "unknown"
-        # Fallback: scan all interfaces
         result2 = _run(["iw", "dev"])
         current = None
         for line in result2.stdout.splitlines():
@@ -205,33 +180,12 @@ class MonitorMode:
                 return s.split()[1]
         return "unknown"
 
-    def _detect_driver(self):
-        """Detect the wireless driver for this interface."""
-        # Try readlink on sysfs driver path
-        r = _run(["readlink", f"/sys/class/net/{self.iface}/device/driver"])
-        if r.returncode == 0:
-            return r.stdout.strip().split("/")[-1].lower()
-        # Try ethtool
-        r2 = _run(["ethtool", "-i", self.iface])
-        if r2.returncode == 0:
-            m = re.search(r"driver:\s*(\S+)", r2.stdout)
-            if m:
-                return m.group(1).lower()
-        return ""
-
-    def _is_brcmfmac(self):
-        """True if this is a Broadcom brcmfmac interface (Pi onboard WiFi)."""
-        if self._driver is None:
-            self._driver = self._detect_driver()
-        return "brcmfmac" in self._driver
-
     def _parse_airmon_output(self, stdout):
-        """Parse airmon-ng start output to extract the monitor interface name."""
-        iface_pat = re.compile(r'\b(wlan\w+|mon\d+|ath\w+|wlp\w+|ra\w+)\b')
-        on_pat    = re.compile(r'\bon\s+\[?(?:phy\d+\])?(wlan\w+|mon\d+|ath\w+|wlp\w+)')
+        on_pat    = re.compile(r"\bon\s+\[?(?:phy\d+\])?(\w+mon\w*|mon\d+)")
+        iface_pat = re.compile(r"\b(wlan\w+mon|mon\d+|ath\w+mon)\b")
         for line in stdout.splitlines():
-            if 'monitor mode' not in line.lower(): continue
-            if 'enabled' not in line.lower(): continue
+            if "monitor mode" not in line.lower(): continue
+            if "enabled" not in line.lower(): continue
             m = on_pat.findall(line)
             if m: return m[-1]
             m2 = iface_pat.findall(line)
@@ -239,7 +193,6 @@ class MonitorMode:
         return None
 
     def _find_any_monitor_iface(self):
-        """Scan iw dev for any interface in monitor mode."""
         result = _run(["iw", "dev"])
         current_iface = None
         for line in result.stdout.splitlines():
@@ -250,61 +203,21 @@ class MonitorMode:
                 return current_iface
         return None
 
-    def _kill_interfering(self):
-        """Stop NetworkManager and wpa_supplicant."""
-        info("Stopping NetworkManager and wpa_supplicant...")
-        _run(["systemctl", "stop", "NetworkManager"])
-        _run(["systemctl", "stop", "wpa_supplicant"])
-        _run(["killall", "-q", "wpa_supplicant"])
-        _run(["killall", "-q", "dhclient"])
-        self._nm_killed = True
-        time.sleep(0.5)
+    def enable(self):
+        """
+        Enable monitor mode — same method as wifite:
+          1. airmon-ng check kill  (kills NM, wpa_supplicant)
+          2. airmon-ng start <iface>
+          3. iw fallback if airmon-ng not available
+        """
+        tools = _check_tools()
 
-    def _unblock_rfkill(self):
-        """Unblock any soft-blocked wifi interfaces."""
+        # Unblock rfkill soft blocks
         if shutil.which("rfkill"):
             r = _run(["rfkill", "list"])
             if "Soft blocked: yes" in r.stdout:
                 _run(["rfkill", "unblock", "wifi"])
                 time.sleep(0.3)
-
-    def _cleanup_stale_monitor(self):
-        """
-        Delete any existing monitor vif on this PHY.
-        Critical for brcmfmac — it returns -95 if a monitor vif already exists.
-        """
-        if not self._phy:
-            return
-        # Find all interfaces on this PHY
-        result = _run(["iw", "dev"])
-        current_phy = None
-        to_delete = []
-        for line in result.stdout.splitlines():
-            stripped = line.strip()
-            if line.startswith("phy#"):
-                current_phy = line.split()[0].replace("#", "")
-            elif stripped.startswith("Interface") and current_phy == self._phy:
-                iface_name = stripped.split()[1]
-                mode = self._get_mode(iface_name)
-                if mode == "monitor":
-                    to_delete.append(iface_name)
-        for mon in to_delete:
-            info(f"Deleting stale monitor interface: {mon}")
-            _run(["ip", "link", "set", mon, "down"])
-            _run(["iw", "dev", mon, "del"])
-            time.sleep(0.3)
-
-    # ── Public API ─────────────────────────────────────────────────────────
-
-    def enable(self):
-        """
-        Put interface into monitor mode.
-        Returns the monitor interface name (may differ from self.iface).
-        """
-        tools  = _check_tools()
-        self._unblock_rfkill()
-        self._phy    = self._get_phy(self.iface)
-        self._driver = self._detect_driver()
 
         # Already in monitor mode?
         if self._get_mode() == "monitor":
@@ -313,107 +226,25 @@ class MonitorMode:
             MonitorMode._active[self._original] = self
             return self.mon_iface
 
-        info(f"Interface: {self.iface}  Driver: {self._driver or 'unknown'}  PHY: {self._phy}")
+        self._phy = self._get_phy(self.iface)
 
-        # ── brcmfmac/Nexmon path (Raspberry Pi onboard WiFi) ─────────────
-        if self._is_brcmfmac():
-            return self._enable_brcmfmac(tools)
-
-        # ── Standard mac80211 path (airmon-ng preferred) ──────────────────
-        return self._enable_mac80211(tools)
-
-    def _enable_brcmfmac(self, tools):
-        """
-        Enable monitor mode on brcmfmac/Nexmon (Pi onboard WiFi).
-
-        Key constraints from Nexmon docs and brcmfmac source:
-        - wlan0 must be DOWN before adding monitor vif
-        - Only ONE monitor vif allowed at a time — delete stale ones first
-        - NM/wpa_supplicant must be killed BEFORE bringing iface down
-        - Power management must be disabled to prevent firmware crash
-        - airmon-ng works if above steps are done first, otherwise use iw directly
-        """
-        info("brcmfmac/Nexmon detected — using Pi-specific monitor mode procedure")
-
-        mon_name = self.iface + "mon"
-
-        # Step 1: Kill NM and wpa_supplicant
-        self._kill_interfering()
-
-        # Step 2: Disable power management (prevents firmware crash)
-        if shutil.which("iwconfig"):
-            _run(["iwconfig", self.iface, "power", "off"])
-
-        # Step 3: Bring wlan0 DOWN (required by brcmfmac before adding monitor vif)
-        info(f"Bringing {self.iface} down...")
-        _run(["ip", "link", "set", self.iface, "down"])
-        time.sleep(0.3)
-
-        # Step 4: Delete any stale monitor vif — CRITICAL for brcmfmac
-        self._cleanup_stale_monitor()
-
-        # Step 5: Try airmon-ng first (it knows about brcmfmac quirks)
-        if tools["airmon-ng"]:
-            result = _run(["airmon-ng", "start", self.iface])
-            mon = self._parse_airmon_output(result.stdout)
-            if mon is None:
-                mon = self._find_any_monitor_iface()
-            if mon:
-                # Disable power management on the monitor interface too
-                if shutil.which("iwconfig"):
-                    _run(["iwconfig", mon, "power", "off"])
-                self.mon_iface = mon
-                self._phy = self._get_phy(mon) or self._phy
-                ok(f"Monitor mode enabled (airmon-ng/brcmfmac) → {self.mon_iface}")
-                _loot("MONITOR_ENABLE", {"iface": self.iface, "mon": mon, "method": "airmon-ng/brcmfmac"})
-                MonitorMode._active[self._original] = self
-                return self.mon_iface
-            warn("airmon-ng did not produce monitor interface — trying iw directly")
-
-        # Step 6: iw phy add (wlan0 is already down from step 3)
-        if not self._phy:
-            err(f"Cannot find PHY for {self.iface}")
-            # Bring wlan0 back up so we don't leave it broken
-            _run(["ip", "link", "set", self.iface, "up"])
-            return self.iface
-
-        info(f"Adding monitor interface {mon_name} on {self._phy}...")
-        r = _run(["iw", self._phy, "interface", "add", mon_name, "type", "monitor"])
-        if r.returncode != 0:
-            err(f"iw interface add failed: {r.stderr.strip() or r.stdout.strip()}")
-            err("Trying last-resort: iw dev set type monitor on wlan0")
-            r2 = _run(["iw", "dev", self.iface, "set", "type", "monitor"])
-            if r2.returncode != 0:
-                err(f"All methods failed. Restoring wlan0...")
-                _run(["ip", "link", "set", self.iface, "up"])
-                return self.iface
-            _run(["ip", "link", "set", self.iface, "up"])
-            self.mon_iface = self.iface
-        else:
-            _run(["ip", "link", "set", mon_name, "up"])
-            if shutil.which("iwconfig"):
-                _run(["iwconfig", mon_name, "power", "off"])
-            self.mon_iface = mon_name
-
-        ok(f"Monitor mode enabled (iw/brcmfmac) → {self.mon_iface}")
-        _loot("MONITOR_ENABLE", {"iface": self.iface, "mon": self.mon_iface, "method": "iw/brcmfmac"})
-        MonitorMode._active[self._original] = self
-        return self.mon_iface
-
-    def _enable_mac80211(self, tools):
-        """Enable monitor mode on standard mac80211 drivers via airmon-ng."""
-        # airmon-ng handles NM kill, rename, everything
+        # ── Method 1: airmon-ng (what wifite uses) ────────────────────────
         if tools["airmon-ng"]:
             info("Killing interfering processes...")
             _run(["airmon-ng", "check", "kill"])
             self._nm_killed = True
+            time.sleep(0.5)
 
+            info(f"Starting monitor mode on {self.iface}...")
             result = _run(["airmon-ng", "start", self.iface])
+
+            # Parse output for monitor interface name
             mon = self._parse_airmon_output(result.stdout)
             if mon is None:
                 mon = self._find_any_monitor_iface()
             if mon is None and self._get_mode(self.iface) == "monitor":
                 mon = self.iface
+
             if mon:
                 self.mon_iface = mon
                 self._phy = self._get_phy(mon) or self._phy
@@ -421,26 +252,37 @@ class MonitorMode:
                 _loot("MONITOR_ENABLE", {"iface": self.iface, "mon": mon, "method": "airmon-ng"})
                 MonitorMode._active[self._original] = self
                 return self.mon_iface
-            warn("airmon-ng did not produce monitor interface — trying iw")
 
-        # iw fallback
+            warn("airmon-ng ran but no monitor interface found — trying iw fallback")
+
+        # ── Method 2: iw fallback ─────────────────────────────────────────
+        if not tools["airmon-ng"]:
+            # Kill NM manually since we skipped airmon-ng check kill
+            _run(["systemctl", "stop", "NetworkManager"])
+            _run(["systemctl", "stop", "wpa_supplicant"])
+            _run(["killall", "-q", "wpa_supplicant"])
+            self._nm_killed = True
+            time.sleep(0.5)
+
         if not self._phy:
             err(f"Cannot find PHY for {self.iface}")
             return self.iface
 
-        if not self._nm_killed:
-            self._kill_interfering()
-
         mon_name = self.iface + "mon"
-        self._cleanup_stale_monitor()
+
+        # Delete stale monitor vif if present
+        if self._get_mode(mon_name) == "monitor":
+            _run(["ip", "link", "set", mon_name, "down"])
+            _run(["iw", "dev", mon_name, "del"])
+            time.sleep(0.3)
 
         r = _run(["iw", self._phy, "interface", "add", mon_name, "type", "monitor"])
         if r.returncode != 0:
-            err(f"iw interface add failed: {r.stderr.strip()}")
+            # Last resort: change mode on existing interface
             _run(["ip", "link", "set", self.iface, "down"])
             r2 = _run(["iw", "dev", self.iface, "set", "type", "monitor"])
             if r2.returncode != 0:
-                err(f"All methods failed.")
+                err("All methods failed.")
                 _run(["ip", "link", "set", self.iface, "up"])
                 return self.iface
             _run(["ip", "link", "set", self.iface, "up"])
@@ -455,111 +297,54 @@ class MonitorMode:
         return self.mon_iface
 
     def disable(self):
-        """
-        Restore managed mode and restart NetworkManager.
-        Handles brcmfmac and standard mac80211 separately.
-        """
+        """Restore managed mode — airmon-ng stop, then restart NetworkManager."""
         tools = _check_tools()
         iface = self.mon_iface or self.iface
         restored = False
 
-        if self._is_brcmfmac():
-            restored = self._disable_brcmfmac(tools, iface)
-        else:
-            # Standard path: airmon-ng stop
-            if tools["airmon-ng"]:
-                result = _run(["airmon-ng", "stop", iface])
-                if result.returncode == 0:
-                    ok(f"airmon-ng stopped {iface}")
-                    restored = True
-                else:
-                    warn(f"airmon-ng stop failed — trying iw")
-            if not restored:
-                restored = self._iw_restore(iface)
+        if tools["airmon-ng"]:
+            result = _run(["airmon-ng", "stop", iface])
+            if result.returncode == 0:
+                ok(f"airmon-ng stopped {iface}")
+                restored = True
 
-        # Restart NetworkManager
+        if not restored:
+            # iw fallback
+            if iface != self._original:
+                _run(["ip", "link", "set", iface, "down"])
+                _run(["iw", "dev", iface, "del"])
+                time.sleep(0.2)
+            if self._phy and self._get_mode(self._original) == "unknown":
+                _run(["iw", self._phy, "interface", "add", self._original, "type", "managed"])
+            else:
+                _run(["ip", "link", "set", self._original, "down"])
+                _run(["iw", "dev", self._original, "set", "type", "managed"])
+            _run(["ip", "link", "set", self._original, "up"])
+            restored = True
+
         if self._nm_killed:
             info("Restarting NetworkManager...")
             r = _run(["systemctl", "start", "NetworkManager"])
-            if r.returncode == 0:
-                ok("NetworkManager restarted.")
-            else:
+            if r.returncode != 0:
                 _run(["service", "network-manager", "start"])
-                warn("Check NetworkManager if WiFi doesn't reconnect.")
+            ok("NetworkManager restarted.")
             self._nm_killed = False
 
         MonitorMode._active.pop(self._original, None)
-        if restored:
-            ok(f"Interface restored → {self._original} (managed)")
-        else:
-            warn(f"Restore may be incomplete — check: iw dev")
+        ok(f"Interface restored → {self._original} (managed)")
         _loot("MONITOR_DISABLE", {"mon": iface, "restored": self._original, "ok": restored})
 
-    def _disable_brcmfmac(self, tools, iface):
-        """Restore brcmfmac/Nexmon interface to managed mode."""
-        # Delete the monitor vif
-        if iface != self._original:
-            info(f"Deleting monitor interface {iface}...")
-            _run(["ip", "link", "set", iface, "down"])
-            r = _run(["iw", "dev", iface, "del"])
-            if r.returncode != 0:
-                warn(f"iw dev {iface} del failed: {r.stderr.strip()[:60]}")
-            time.sleep(0.3)
-        else:
-            # Same interface was used — set it back to managed
-            _run(["ip", "link", "set", iface, "down"])
-            _run(["iw", "dev", iface, "set", "type", "managed"])
-
-        # Re-add managed interface if it disappeared
-        if self._get_mode(self._original) == "unknown" and self._phy:
-            info(f"Re-adding {self._original} as managed on {self._phy}...")
-            r2 = _run(["iw", self._phy, "interface", "add",
-                       self._original, "type", "managed"])
-            if r2.returncode == 0:
-                _run(["ip", "link", "set", self._original, "up"])
-                return True
-            else:
-                warn(f"Could not re-add {self._original}: {r2.stderr.strip()[:60]}")
-                return False
-        else:
-            _run(["ip", "link", "set", self._original, "up"])
-            return True
-
-    def _iw_restore(self, iface):
-        """Generic iw-based restore to managed mode."""
-        if iface != self._original:
-            _run(["ip", "link", "set", iface, "down"])
-            _run(["iw", "dev", iface, "del"])
-        if self._phy and self._get_mode(self._original) == "unknown":
-            r = _run(["iw", self._phy, "interface", "add",
-                     self._original, "type", "managed"])
-            if r.returncode == 0:
-                _run(["ip", "link", "set", self._original, "up"])
-                return True
-        _run(["ip", "link", "set", self._original, "down"])
-        _run(["iw", "dev", self._original, "set", "type", "managed"])
-        _run(["ip", "link", "set", self._original, "up"])
-        return True
-
     def set_channel(self, channel):
-        """Set WiFi channel on the monitor interface."""
         iface = self.mon_iface or self.iface
-        result = _run(["iw", "dev", iface, "set", "channel", str(channel)])
-        if result.returncode == 0:
-            return True
+        r = _run(["iw", "dev", iface, "set", "channel", str(channel)])
+        if r.returncode == 0: return True
         if self._phy:
             r2 = _run(["iw", self._phy, "set", "channel", str(channel)])
-            if r2.returncode == 0:
-                return True
-        warn(f"Channel {channel} set failed: {result.stderr.strip()[:80]}")
+            if r2.returncode == 0: return True
         return False
 
     @classmethod
     def disable_all(cls):
-        """Emergency restore — disable all active monitor mode instances."""
-        if not cls._active:
-            return
-        info("Restoring all monitor mode interfaces...")
         for orig_iface, instance in list(cls._active.items()):
             try:
                 instance.disable()
