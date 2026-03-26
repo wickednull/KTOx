@@ -2082,12 +2082,15 @@ class KTOxApp(ctk.CTk):
         dialog = ctk.CTkInputDialog(text="Target AP BSSID:", title="Deauth Attack")
         bssid  = dialog.get_input()
         if not bssid: return
+        chan_d  = ctk.CTkInputDialog(text="Channel (default 6):", title="Deauth Attack")
+        chan_s  = chan_d.get_input()
+        channel = int(chan_s) if chan_s and chan_s.isdigit() else 6
         iface = self._wifi_get_iface()
-        self._log(f"Deauth {iface} → {bssid}", "red")
+        self._log(f"Deauth {iface} → {bssid} ch{channel}", "red")
         def _run():
             try:
                 import ktox_wifi
-                d = ktox_wifi.DeauthAttack(iface, bssid, count=64)
+                d = ktox_wifi.DeauthAttack(iface, bssid, count=64, channel=channel)
                 d.attack()
                 self._log("Deauth complete.", "green")
             except Exception as ex:

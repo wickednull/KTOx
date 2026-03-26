@@ -39,7 +39,7 @@
 
 - **50+ attack, recon, and defensive modules** across 7 engine files
 - **Blood-red terminal TUI** powered by Rich
-- **Matching CustomTkinter desktop GUI** — adaptive, screen-aware
+- **Cyberpunk CustomTkinter desktop GUI** — adaptive, screen-aware
 - **Live web dashboard** — browser UI updating every 1.5 seconds
 - **Caplet automation engine** — script attack sequences in `.ktox` files
 - **IoT fingerprinter** — 5-layer device identification
@@ -71,7 +71,7 @@ sudo ./venv/bin/python3 ktox.py --gui
 
 ```
 KTOx/
-├── ktox.py             ← Entry point + full CLI TUI (all 50+ modules)
+├── ktox.py             ← Entry point + full CLI TUI (all 35+ modules)
 ├── ktox_gui.py         ← CustomTkinter adaptive GUI
 ├── ktox_mitm.py        ← MITM engine: DNS/DHCP spoof, SSL strip, captive portal
 ├── ktox_advanced.py    ← JS injector, multi-protocol sniffer, PCAP, NTLMv2, session hijack, caplets
@@ -83,7 +83,7 @@ KTOx/
 ├── ktox_repl.py        ← Interactive REPL shell + plugin system
 ├── ktox_config.py      ← Persistent configuration (~/.ktox/config.json)
 ├── ktox_dashboard.py   ← Live web dashboard (Flask)
-├── scan.py             ← nmap network scanner module
+├── scan.py             ← nmap network scanner — returns IP, MAC, vendor, hostname
 ├── spoof.py            ← scapy ARP packet engine
 ├── README.md           ← you are here
 ├── index.html          ← GitHub Pages site
@@ -175,7 +175,23 @@ KTOx/
 [S]  Hash Cracker              hashcat/john interface for captured hashes
 ```
 
-### ── DEFENSIVE ───────────────────────────────────────────────────────────
+### ── WiFi ENGINE (ktox_wifi.py) ─────────────────────────────────────────
+
+```
+[W]  WiFi Engine menu
+     [I]  Select Interface      Pick wlan0, wlan1, Alfa, TP-Link — persists session
+     [1]  Enable Monitor Mode   airmon-ng check kill → airmon-ng start
+                                Auto-detects driver (brcmfmac/Nexmon for Pi onboard)
+                                Watchdog + auto-recovery if interface crashes
+     [2]  WiFi Scanner          airodump-ng CSV backend — APs, clients, signal,
+                                encryption, client↔AP association, live updates
+     [3]  Deauth Attack         802.11 deauth frames — single client or broadcast
+                                Watchdog checks interface health every 50 frames
+     [4]  Handshake Capture     WPA2 4-way EAPOL — saves .cap for aircrack/hashcat
+     [5]  PMKID Attack          Clientless WPA2 hash capture (no handshake needed)
+     [6]  Evil Twin AP          Rogue AP with hostapd + dnsmasq + captive portal
+     [7]  Disable Monitor Mode  airmon-ng stop → restart NetworkManager
+```
 
 ```
 [D]  ARP Watch                 Passive conflict monitor (packet sniff)
@@ -373,26 +389,88 @@ jq 'select(.event | startswith("CRED"))'    ktox_loot/*.log
 
 ---
 
+## ▐ SCREENSHOTS
+
+| TUI Main Menu | MITM Engine | Desktop GUI |
+|:---:|:---:|:---:|
+| ![TUI](assets/screenshot_tui.png) | ![MITM](assets/screenshot_mitm.png) | ![GUI](assets/screenshot_gui.png) |
+
+| Web Dashboard | WiFi Engine |
+|:---:|:---:|
+| ![Dashboard](assets/screenshot_dashboard.png) | ![WiFi](assets/screenshot_wifi.png) |
+
+---
+
+## ▐ RASPBERRY PI 5 — WIFI MONITOR MODE
+
+KTOx uses the same monitor mode method as wifite — `airmon-ng check kill` then `airmon-ng start`. For the Pi 5 onboard WiFi (brcmfmac/Nexmon), install the Kali Nexmon packages first:
+
+```bash
+sudo apt update && sudo apt full-upgrade -y
+sudo apt install -y brcmfmac-nexmon-dkms firmware-nexmon
+sudo reboot
+```
+
+After reboot, enable monitor mode from `[W] WiFi Engine` → `[1] Enable Monitor Mode`. KTOx detects the driver automatically, runs `airmon-ng check kill`, starts monitor mode, then confirms `wlan0mon` exists in `iw dev` before reporting success. If the interface crashes mid-session, the built-in watchdog recovers it automatically.
+
+External USB adapters (Alfa AWUS036ACH, TP-Link TL-WN722N, etc.) work out of the box — select them with `[I] Select Interface` in the WiFi menu.
+
+---
+
 ## ▐ REQUIREMENTS
+
+### Python dependencies
+
+```bash
+pip3 install -r requirements.txt
+```
+
+Or manually:
 
 ```bash
 pip3 install rich scapy python-nmap netifaces customtkinter flask
 ```
 
-System dependencies:
+> **Kali / Debian with system Python (no venv):**
+> ```bash
+> sudo pip3 install -r requirements.txt --break-system-packages
+> ```
+
+| Package | Purpose |
+|---------|---------|
+| `rich` | Terminal TUI — colours, tables, panels, spinners |
+| `scapy` | Packet crafting — ARP, 802.11, ICMP, EAPOL frames |
+| `python-nmap` | Network scanning (wraps nmap) |
+| `netifaces` | Interface and gateway enumeration |
+| `customtkinter` | Desktop GUI |
+| `flask` | Live web dashboard at localhost:9999 |
+
+### System dependencies
+
 ```bash
-# Debian / Ubuntu / Kali
-sudo apt install nmap hashcat john aircrack-ng hostapd dnsmasq
+# Kali / Debian / Ubuntu — install everything at once
+sudo apt install -y nmap aircrack-ng hostapd dnsmasq hashcat john ethtool net-tools
 
 # Raspberry Pi 5 — onboard WiFi monitor mode (Kali 2025.1+)
-sudo apt install brcmfmac-nexmon-dkms firmware-nexmon && sudo reboot
+sudo apt install -y brcmfmac-nexmon-dkms firmware-nexmon && sudo reboot
 
 # Arch
-sudo pacman -S nmap hashcat john
+sudo pacman -S nmap aircrack-ng hostapd dnsmasq hashcat
 
-# macOS
+# macOS (limited — WiFi modules require Linux)
 brew install nmap libdnet
 ```
+
+| Tool | Purpose | Required |
+|------|---------|----------|
+| `nmap` | Host discovery and port scanning | ✔ Core |
+| `aircrack-ng` suite | `airmon-ng`, `airodump-ng`, `aireplay-ng` for WiFi engine | WiFi only |
+| `hostapd` | Evil Twin AP | WiFi only |
+| `dnsmasq` | Evil Twin DHCP/DNS | WiFi only |
+| `hashcat` | WPA/NTLMv2 hash cracking | Optional |
+| `john` | Alternative hash cracker | Optional |
+| `ethtool` | Driver detection for monitor mode | Recommended |
+| `net-tools` | `arp` command for ARP table ops | Recommended |
 
 ---
 
@@ -401,7 +479,12 @@ brew install nmap libdnet
 ```bash
 git clone https://github.com/wickednull/KTOx
 cd KTOx
-pip3 install rich scapy python-nmap netifaces customtkinter flask
+
+# Install Python dependencies
+sudo pip3 install -r requirements.txt --break-system-packages
+
+# Install system tools (Kali/Debian)
+sudo apt install -y nmap aircrack-ng hostapd dnsmasq hashcat ethtool net-tools
 
 # CLI
 sudo python3 ktox.py
@@ -409,8 +492,11 @@ sudo python3 ktox.py
 # GUI
 sudo python3 ktox.py --gui
 
-# If using a venv with sudo
-sudo ./venv/bin/python3 ktox.py --gui
+# Venv (optional — use if you don't want --break-system-packages)
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+sudo ./venv/bin/python3 ktox.py
 ```
 
 ---

@@ -1145,7 +1145,19 @@ footer {
     <div class="tip-label">⚡ LLMNR FACT</div>
     <div class="tip-text">LLMNR (Link-Local Multicast Name Resolution) was introduced in Windows Vista as a fallback when DNS fails. When a Windows machine can't find a hostname via DNS, it broadcasts a multicast query to the entire LAN segment — no authentication, no verification. KTOx responds claiming to be that hostname. The victim's machine then automatically sends NTLMv2 credentials to authenticate. This happens with <strong style="color:var(--white)">zero user interaction</strong> — just a mistyped hostname or a network resource that doesn't exist.</div>
   </div>
-</section>
+    <div class="module-card">
+      <div class="module-key">WiFi ENGINE</div>
+      <div class="module-name">Monitor · Scan · Attack</div>
+      <div class="module-desc">Interface selector for wlan0, wlan1, Alfa, TP-Link adapters. Monitor mode via airmon-ng (same method as wifite). WiFi scanner powered by airodump-ng with CSV parsing — live AP discovery, client association, signal strength, encryption. Deauth attack, WPA2 handshake capture, PMKID clientless hash capture, Evil Twin AP. Built-in watchdog auto-recovers crashed interfaces. Raspberry Pi 5 onboard WiFi supported via Nexmon.</div>
+      <div class="module-tags">
+        <span class="mtag mtag-red">Monitor</span>
+        <span class="mtag mtag-red">Deauth</span>
+        <span class="mtag mtag-yellow">airodump-ng</span>
+        <span class="mtag mtag-yellow">key W</span>
+      </div>
+    </div>
+
+  </section>
 
 <div class="redline"></div>
 

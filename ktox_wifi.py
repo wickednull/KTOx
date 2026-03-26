@@ -140,16 +140,45 @@ def _get_wireless_interfaces():
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MonitorMode:
-    """Enable/disable monitor mode. Uses airmon-ng exactly like wifite does."""
+    """
+    Monitor mode manager based on WifiManager pattern.
+    Simple: airmon-ng check kill → airmon-ng start → verify by scanning iw dev.
+    Includes watchdog and auto-recovery for interface crashes.
+    """
 
     _active = {}  # registry: original_iface -> instance
 
     def __init__(self, iface):
-        self.iface     = iface
-        self._original = iface
-        self.mon_iface = None
-        self._phy      = None
+        self.iface      = iface        # base interface (wlan0, wlan1...)
+        self._original  = iface
+        self.mon_iface  = None         # monitor interface (wlan0mon...)
+        self._phy       = None
         self._nm_killed = False
+        self.driver     = None
+        self.is_nexmon  = False
+
+    # ── Hardware detection ─────────────────────────────────────────────────
+
+    def detect_hardware(self):
+        """Detect driver and whether this is a Nexmon/brcmfmac interface."""
+        try:
+            r = _run(["ethtool", "-i", self.iface])
+            if r.returncode == 0:
+                m = re.search(r"driver:\s*(\S+)", r.stdout)
+                if m:
+                    self.driver = m.group(1)
+                    if "brcmfmac" in self.driver:
+                        self.is_nexmon = True
+                        info(f"brcmfmac/Nexmon detected on {self.iface} (Pi internal Wi-Fi)")
+                    else:
+                        info(f"Driver: {self.driver} (external adapter)")
+        except Exception:
+            pass
+
+    def get_interfaces(self):
+        """Return list of all current wireless interface names."""
+        result = _run(["iw", "dev"])
+        return re.findall(r"Interface\s+(\w+)", result.stdout)
 
     def _get_phy(self, iface=None):
         target = iface or self.iface
@@ -180,35 +209,64 @@ class MonitorMode:
                 return s.split()[1]
         return "unknown"
 
-    def _parse_airmon_output(self, stdout):
-        on_pat    = re.compile(r"\bon\s+\[?(?:phy\d+\])?(\w+mon\w*|mon\d+)")
-        iface_pat = re.compile(r"\b(wlan\w+mon|mon\d+|ath\w+mon)\b")
-        for line in stdout.splitlines():
-            if "monitor mode" not in line.lower(): continue
-            if "enabled" not in line.lower(): continue
-            m = on_pat.findall(line)
-            if m: return m[-1]
-            m2 = iface_pat.findall(line)
-            if m2: return m2[-1]
+    def detect_monitor_interface(self):
+        """
+        Scan iw dev for any interface ending in 'mon'.
+        More reliable than parsing airmon-ng output text.
+        """
+        for iface in self.get_interfaces():
+            if iface.endswith("mon"):
+                return iface
         return None
 
-    def _find_any_monitor_iface(self):
-        result = _run(["iw", "dev"])
-        current_iface = None
-        for line in result.stdout.splitlines():
-            s = line.strip()
-            if s.startswith("Interface"):
-                current_iface = s.split()[1]
-            if s.startswith("type monitor") and current_iface:
-                return current_iface
-        return None
+    # ── Health check + recovery ────────────────────────────────────────────
+
+    def interface_alive(self):
+        """Check if the monitor interface actually exists in iw dev."""
+        if not self.mon_iface:
+            return False
+        return self.mon_iface in self.get_interfaces()
+
+    def recover_interface(self):
+        """
+        Recovery procedure when monitor interface crashes.
+        Stops monitor mode, bounces the base interface, retries.
+        """
+        warn(f"Attempting interface recovery for {self.iface}...")
+
+        if self.mon_iface:
+            _run(["airmon-ng", "stop", self.mon_iface])
+            self.mon_iface = None
+
+        if self.iface:
+            _run(["ip", "link", "set", self.iface, "down"])
+            time.sleep(0.5)
+            _run(["ip", "link", "set", self.iface, "up"])
+
+        time.sleep(2)
+        info("Re-enabling monitor mode...")
+        return self.enable()
+
+    def watchdog(self):
+        """
+        Call this inside scan/attack loops to detect and recover from crashes.
+        Returns True if interface is healthy, False if recovery was needed.
+        """
+        if not self.interface_alive():
+            warn(f"Interface {self.mon_iface} crashed — recovering...")
+            self.recover_interface()
+            return False
+        return True
+
+    # ── Enable / disable ───────────────────────────────────────────────────
 
     def enable(self):
         """
-        Enable monitor mode — same method as wifite:
-          1. airmon-ng check kill  (kills NM, wpa_supplicant)
+        Enable monitor mode.
+          1. airmon-ng check kill
           2. airmon-ng start <iface>
-          3. iw fallback if airmon-ng not available
+          3. Detect monitor interface by scanning for *mon interfaces
+          4. Fallback to iw if airmon-ng not available
         """
         tools = _check_tools()
 
@@ -219,6 +277,9 @@ class MonitorMode:
                 _run(["rfkill", "unblock", "wifi"])
                 time.sleep(0.3)
 
+        self.detect_hardware()
+        self._phy = self._get_phy(self.iface)
+
         # Already in monitor mode?
         if self._get_mode() == "monitor":
             self.mon_iface = self.iface
@@ -226,59 +287,53 @@ class MonitorMode:
             MonitorMode._active[self._original] = self
             return self.mon_iface
 
-        self._phy = self._get_phy(self.iface)
-
-        # ── Method 1: airmon-ng (what wifite uses) ────────────────────────
         if tools["airmon-ng"]:
-            info("Killing interfering processes...")
+            info("Killing conflicting processes...")
             _run(["airmon-ng", "check", "kill"])
             self._nm_killed = True
             time.sleep(0.5)
 
             info(f"Starting monitor mode on {self.iface}...")
-            result = _run(["airmon-ng", "start", self.iface])
+            _run(["airmon-ng", "start", self.iface])
 
-            # Parse output for monitor interface name
-            mon = self._parse_airmon_output(result.stdout)
-            if mon is None:
-                mon = self._find_any_monitor_iface()
-            if mon is None and self._get_mode(self.iface) == "monitor":
-                mon = self.iface
+            time.sleep(2)
 
-            if mon:
-                self.mon_iface = mon
-                self._phy = self._get_phy(mon) or self._phy
-                ok(f"Monitor mode enabled → {self.mon_iface}")
-                _loot("MONITOR_ENABLE", {"iface": self.iface, "mon": mon, "method": "airmon-ng"})
-                MonitorMode._active[self._original] = self
-                return self.mon_iface
+            # Detect by scanning for *mon interfaces — not by parsing text
+            self.mon_iface = self.detect_monitor_interface()
 
-            warn("airmon-ng ran but no monitor interface found — trying iw fallback")
+            if not self.mon_iface:
+                warn("Monitor mode failed — attempting recovery...")
+                result = self.recover_interface()
+                if not result:
+                    err("Could not enable monitor mode.")
+                    return self.iface
+                return result
 
-        # ── Method 2: iw fallback ─────────────────────────────────────────
-        if not tools["airmon-ng"]:
-            # Kill NM manually since we skipped airmon-ng check kill
-            _run(["systemctl", "stop", "NetworkManager"])
-            _run(["systemctl", "stop", "wpa_supplicant"])
-            _run(["killall", "-q", "wpa_supplicant"])
-            self._nm_killed = True
-            time.sleep(0.5)
+            ok(f"Monitor active: {self.mon_iface}")
+            _loot("MONITOR_ENABLE", {"iface": self.iface, "mon": self.mon_iface, "method": "airmon-ng"})
+            MonitorMode._active[self._original] = self
+            return self.mon_iface
+
+        # ── iw fallback (no airmon-ng) ─────────────────────────────────────
+        _run(["systemctl", "stop", "NetworkManager"])
+        _run(["systemctl", "stop", "wpa_supplicant"])
+        _run(["killall", "-q", "wpa_supplicant"])
+        self._nm_killed = True
+        time.sleep(0.5)
 
         if not self._phy:
             err(f"Cannot find PHY for {self.iface}")
             return self.iface
 
         mon_name = self.iface + "mon"
-
-        # Delete stale monitor vif if present
-        if self._get_mode(mon_name) == "monitor":
-            _run(["ip", "link", "set", mon_name, "down"])
-            _run(["iw", "dev", mon_name, "del"])
+        stale = self.detect_monitor_interface()
+        if stale:
+            _run(["ip", "link", "set", stale, "down"])
+            _run(["iw", "dev", stale, "del"])
             time.sleep(0.3)
 
         r = _run(["iw", self._phy, "interface", "add", mon_name, "type", "monitor"])
         if r.returncode != 0:
-            # Last resort: change mode on existing interface
             _run(["ip", "link", "set", self.iface, "down"])
             r2 = _run(["iw", "dev", self.iface, "set", "type", "monitor"])
             if r2.returncode != 0:
@@ -297,19 +352,13 @@ class MonitorMode:
         return self.mon_iface
 
     def disable(self):
-        """Restore managed mode — airmon-ng stop, then restart NetworkManager."""
+        """Stop monitor mode and restart NetworkManager."""
         tools = _check_tools()
         iface = self.mon_iface or self.iface
-        restored = False
 
         if tools["airmon-ng"]:
-            result = _run(["airmon-ng", "stop", iface])
-            if result.returncode == 0:
-                ok(f"airmon-ng stopped {iface}")
-                restored = True
-
-        if not restored:
-            # iw fallback
+            _run(["airmon-ng", "stop", iface])
+        else:
             if iface != self._original:
                 _run(["ip", "link", "set", iface, "down"])
                 _run(["iw", "dev", iface, "del"])
@@ -320,19 +369,19 @@ class MonitorMode:
                 _run(["ip", "link", "set", self._original, "down"])
                 _run(["iw", "dev", self._original, "set", "type", "managed"])
             _run(["ip", "link", "set", self._original, "up"])
-            restored = True
 
         if self._nm_killed:
             info("Restarting NetworkManager...")
             r = _run(["systemctl", "start", "NetworkManager"])
             if r.returncode != 0:
-                _run(["service", "network-manager", "start"])
+                _run(["service", "NetworkManager", "restart"])
             ok("NetworkManager restarted.")
             self._nm_killed = False
 
+        self.mon_iface = None
         MonitorMode._active.pop(self._original, None)
         ok(f"Interface restored → {self._original} (managed)")
-        _loot("MONITOR_DISABLE", {"mon": iface, "restored": self._original, "ok": restored})
+        _loot("MONITOR_DISABLE", {"mon": iface, "restored": self._original})
 
     def set_channel(self, channel):
         iface = self.mon_iface or self.iface
@@ -345,158 +394,262 @@ class MonitorMode:
 
     @classmethod
     def disable_all(cls):
-        for orig_iface, instance in list(cls._active.items()):
+        for orig, instance in list(cls._active.items()):
             try:
                 instance.disable()
             except Exception as e:
-                warn(f"Failed to restore {orig_iface}: {e}")
+                warn(f"Failed to restore {orig}: {e}")
         cls._active.clear()
 
 
 class WiFiScanner:
     """
-    Passive WiFi scanner using scapy Dot11.
-    Discovers APs (from beacons) and clients (from probe requests and data frames).
-    Performs channel hopping to cover the full 2.4GHz + 5GHz spectrum.
+    WiFi scanner using airodump-ng + CSV parsing.
+    Runs airodump-ng in the background writing to /tmp/ktox_scan-01.csv,
+    parses it every 2 seconds for live updates, with channel hopping and
+    a watchdog thread to detect interface crashes.
     """
 
-    def __init__(self, mon_iface, hop_interval=0.5):
-        self.iface       = mon_iface
-        self.hop_interval= hop_interval
-        self.networks    = {}  # bssid → network info
-        self.clients     = {}  # client_mac → {bssid, signal}
-        self._hop_thread = None
-        self._channels   = list(range(1, 15)) + [36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,149,153,157,161,165]
+    OUTPUT_PREFIX = "/tmp/ktox_scan"
 
-    def _channel_hop(self):
-        """Continuously cycle through channels."""
-        mon = MonitorMode(self.iface)
+    def __init__(self, mon_iface, monitor_instance=None):
+        self.iface        = mon_iface
+        self.monitor      = monitor_instance  # MonitorMode for watchdog/recovery
+        self.networks     = {}   # bssid → network dict
+        self.clients      = {}   # station_mac → client dict
+        self.running      = False
+        self._scan_thread = None
+        self._hop_thread  = None
+        self._watch_thread= None
+        self._airodump_proc = None
+
+    # ── Channel hopping ────────────────────────────────────────────────────
+
+    def _channel_hopper(self):
+        channels = list(range(1, 14)) + [36, 40, 44, 48, 52, 56, 60, 64,
+                                          100, 104, 108, 112, 116, 132, 136,
+                                          140, 149, 153, 157, 161, 165]
         idx = 0
-        while not stop_flag.is_set():
-            ch = self._channels[idx % len(self._channels)]
-            _run(["iw", self.iface, "set", "channel", str(ch)])
-            time.sleep(self.hop_interval)
+        while self.running:
+            ch = channels[idx % len(channels)]
+            subprocess.call(
+                ["iwconfig", self.iface, "channel", str(ch)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
             idx += 1
+            time.sleep(0.5)
 
-    def _handle_packet(self, pkt):
-        ts = datetime.now().strftime("%H:%M:%S")
+    # ── airodump-ng scan loop ──────────────────────────────────────────────
 
-        # ── Beacon → access point ──────────────────────────────────────
-        if pkt.haslayer(Dot11Beacon):
-            bssid = pkt[Dot11].addr3
-            if not bssid: return
+    def _scan_loop(self):
+        # Clean up any leftover files from previous run
+        for ext in ["-01.csv", "-01.cap", "-01.kismet.csv",
+                    "-01.kismet.netxml", "-01.log.csv"]:
+            try:
+                os.remove(self.OUTPUT_PREFIX + ext)
+            except FileNotFoundError:
+                pass
 
-            ssid     = ""
-            channel  = 0
-            crypto   = set()
-            signal   = getattr(pkt, "dBm_AntSignal", 0) if pkt.haslayer(RadioTap) else 0
-
-            elt = pkt[Dot11Elt]
-            while elt:
-                try:
-                    if elt.ID == 0:    # SSID
-                        ssid = elt.info.decode("utf-8", errors="ignore")
-                    elif elt.ID == 3:  # Channel
-                        channel = elt.info[0]
-                    elif elt.ID == 48: # RSN → WPA2
-                        crypto.add("WPA2")
-                    elif elt.ID == 221 and elt.info[:4] == b'\x00P\xf2\x01':
-                        crypto.add("WPA")
-                except: pass
-                try: elt = elt.payload.getlayer(Dot11Elt)
-                except: break
-
-            # Detect encryption from capability field
-            cap = pkt[Dot11Beacon].cap
-            if not crypto:
-                if cap & 0x0010:
-                    crypto.add("WEP")
-                else:
-                    crypto.add("OPEN")
-
-            if bssid not in self.networks:
-                self.networks[bssid] = {
-                    "ssid":    ssid or "<hidden>",
-                    "bssid":   bssid,
-                    "channel": channel,
-                    "crypto":  crypto,
-                    "signal":  signal,
-                    "clients": set(),
-                    "first_seen": ts,
-                }
-                crypto_str = "/".join(sorted(crypto))
-                color = C_BLOOD if "WPA2" in crypto or "WPA" in crypto else \
-                        C_ORANGE if "WEP" in crypto else C_GOOD
-                console.print(
-                    f"  [{C_YELLOW}]AP[/{C_YELLOW}]  "
-                    f"[{C_WHITE}]{ssid or '<hidden>':32s}[/{C_WHITE}]  "
-                    f"[{C_STEEL}]{bssid}[/{C_STEEL}]  "
-                    f"ch[{C_DIM}]{channel:3d}[/{C_DIM}]  "
-                    f"[{color}]{crypto_str}[/{color}]  "
-                    f"[{C_DIM}]{signal}dBm  {ts}[/{C_DIM}]"
-                )
-                _loot("WIFI_AP", {
-                    "ssid": ssid, "bssid": bssid,
-                    "channel": channel, "crypto": list(crypto)
-                })
-            else:
-                # Update signal
-                self.networks[bssid]["signal"] = signal
-
-        # ── Probe Request → client looking for network ─────────────────
-        elif pkt.haslayer(Dot11ProbeReq):
-            src  = pkt[Dot11].addr2
-            if not src or src == "ff:ff:ff:ff:ff:ff": return
-            ssid = ""
-            try: ssid = pkt[Dot11Elt].info.decode("utf-8", errors="ignore")
-            except: pass
-            if src not in self.clients:
-                self.clients[src] = {"probing": ssid, "associated": None, "ts": ts}
-                console.print(
-                    f"  [{C_STEEL}]CLIENT[/{C_STEEL}]  "
-                    f"[{C_ASH}]{src}[/{C_ASH}]  probing  "
-                    f"[{C_WHITE}]{ssid or '<any>'}[/{C_WHITE}]  "
-                    f"[{C_DIM}]{ts}[/{C_DIM}]"
-                )
-
-        # ── Data frame → client associated to AP ──────────────────────
-        elif pkt.haslayer(Dot11) and pkt.type == 2:
-            src  = pkt[Dot11].addr2
-            bssid= pkt[Dot11].addr1
-            if src and bssid and src != bssid:
-                if bssid in self.networks:
-                    self.networks[bssid]["clients"].add(src)
-                    if src not in self.clients:
-                        self.clients[src] = {
-                            "probing": None,
-                            "associated": bssid,
-                            "ts": ts
-                        }
-
-    def scan(self, duration=30):
-        """Scan for duration seconds with channel hopping."""
-        section("WiFi SCANNER")
-        info(f"Scanning for {duration}s — channel hopping 2.4GHz + 5GHz...")
-        info("Ctrl+C to stop early and show results.\n")
-
-        # Start channel hopper
-        self._hop_thread = threading.Thread(
-            target=self._channel_hop, daemon=True
+        self._airodump_proc = subprocess.Popen(
+            ["airodump-ng",
+             "--write",         self.OUTPUT_PREFIX,
+             "--output-format", "csv",
+             self.iface],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
         )
-        self._hop_thread.start()
+
+        csv_file = self.OUTPUT_PREFIX + "-01.csv"
 
         try:
-            sniff(
-                iface=self.iface,
-                prn=self._handle_packet,
-                store=False,
-                timeout=duration,
-                stop_filter=lambda _: stop_flag.is_set()
-            )
+            while self.running:
+                time.sleep(2)
+
+                if self._airodump_proc.poll() is not None:
+                    err("airodump-ng process died unexpectedly")
+                    self.running = False
+                    break
+
+                if os.path.exists(csv_file):
+                    self._parse_csv(csv_file)
+
+        finally:
+            if self._airodump_proc.poll() is None:
+                self._airodump_proc.terminate()
+                try:
+                    self._airodump_proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self._airodump_proc.kill()
+
+    # ── CSV parsing ────────────────────────────────────────────────────────
+
+    def _parse_csv(self, filepath):
+        """
+        Parse airodump-ng CSV. Format has two sections:
+          APs:     BSSID, First time seen, Last time seen, channel, Speed,
+                   Privacy, Cipher, Authentication, Power, # beacons,
+                   # IV, LAN IP, ID-length, ESSID, Key
+          Clients: Station MAC, First time seen, Last time seen, Power,
+                   # packets, BSSID, Probed ESSIDs
+        """
+        try:
+            with open(filepath, newline="",
+                      encoding="utf-8", errors="ignore") as f:
+                reader = csv.reader(f)
+                parsing_ap = True
+
+                for row in reader:
+                    row = [c.strip() for c in row]
+
+                    # Switch to client section
+                    if row and row[0] == "Station MAC":
+                        parsing_ap = False
+                        continue
+
+                    if parsing_ap:
+                        if len(row) < 14: continue
+                        bssid = row[0]
+                        if not bssid or bssid == "BSSID": continue
+
+                        # Normalise encryption string
+                        enc = row[5]
+                        if "WPA2" in enc:    enc = "WPA2"
+                        elif "WPA" in enc:   enc = "WPA"
+                        elif "WEP" in enc:   enc = "WEP"
+                        else:               enc = "OPEN"
+
+                        existing = self.networks.get(bssid)
+                        net = {
+                            "bssid":      bssid,
+                            "ssid":       row[13] or "<hidden>",
+                            "channel":    row[3],
+                            "signal":     row[8],
+                            "encryption": enc,
+                            "clients":    existing["clients"] if existing else set(),
+                        }
+
+                        if not existing:
+                            self.networks[bssid] = net
+                            color = C_BLOOD if enc in ("WPA2","WPA") else \
+                                    C_ORANGE if enc == "WEP" else C_GOOD
+                            console.print(
+                                f"  [{C_YELLOW}]AP[/{C_YELLOW}]  "
+                                f"[{C_WHITE}]{net['ssid']:28s}[/{C_WHITE}]  "
+                                f"[{C_STEEL}]{bssid}[/{C_STEEL}]  "
+                                f"ch[{C_DIM}]{net['channel']:>3}[/{C_DIM}]  "
+                                f"[{color}]{enc:<5}[/{color}]  "
+                                f"[{C_DIM}]{net['signal']} dBm[/{C_DIM}]"
+                            )
+                            _loot("WIFI_AP", {
+                                "ssid": net["ssid"], "bssid": bssid,
+                                "channel": net["channel"], "crypto": enc
+                            })
+                        else:
+                            self.networks[bssid].update(net)
+
+                    else:
+                        # Client row
+                        if len(row) < 6: continue
+                        mac = row[0]
+                        if not mac or mac == "Station MAC": continue
+
+                        ap_bssid = row[5]
+                        probing  = row[6] if len(row) > 6 else ""
+                        signal   = row[3]
+
+                        if mac not in self.clients:
+                            self.clients[mac] = {
+                                "mac":      mac,
+                                "bssid":    ap_bssid,
+                                "probing":  probing,
+                                "signal":   signal,
+                            }
+                            console.print(
+                                f"  [{C_STEEL}]CLIENT[/{C_STEEL}]  "
+                                f"[{C_ASH}]{mac}[/{C_ASH}]  "
+                                f"→ [{C_WHITE}]{ap_bssid or '<not assoc>'}[/{C_WHITE}]  "
+                                f"[{C_DIM}]{probing[:24]}[/{C_DIM}]"
+                            )
+                        else:
+                            self.clients[mac].update({
+                                "bssid": ap_bssid,
+                                "probing": probing,
+                                "signal": signal,
+                            })
+
+                        # Link client to AP
+                        if ap_bssid and ap_bssid in self.networks:
+                            self.networks[ap_bssid]["clients"].add(mac)
+
+        except Exception as ex:
+            warn(f"CSV parse error: {ex}")
+
+    # ── Watchdog ───────────────────────────────────────────────────────────
+
+    def _watchdog(self):
+        while self.running:
+            time.sleep(5)
+            try:
+                out = subprocess.check_output(["iw", "dev"],
+                                              stderr=subprocess.DEVNULL).decode()
+                if self.iface not in out:
+                    warn(f"Interface {self.iface} lost — stopping scan")
+                    self.running = False
+                    if self._airodump_proc and self._airodump_proc.poll() is None:
+                        self._airodump_proc.terminate()
+            except Exception:
+                pass
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    def start(self):
+        """Start scanning in background threads (non-blocking)."""
+        if not shutil.which("airodump-ng"):
+            err("airodump-ng not found. Install: sudo apt install aircrack-ng")
+            return False
+        self.running = True
+        self._scan_thread  = threading.Thread(target=self._scan_loop,      daemon=True)
+        self._hop_thread   = threading.Thread(target=self._channel_hopper, daemon=True)
+        self._watch_thread = threading.Thread(target=self._watchdog,       daemon=True)
+        self._scan_thread.start()
+        self._hop_thread.start()
+        self._watch_thread.start()
+        return True
+
+    def stop(self):
+        """Stop all threads and airodump-ng."""
+        self.running = False
+        if self._airodump_proc and self._airodump_proc.poll() is None:
+            self._airodump_proc.terminate()
+
+    def scan(self, duration=30):
+        """Blocking scan for duration seconds. Prints live results, shows table at end."""
+        if not shutil.which("airodump-ng"):
+            err("airodump-ng not found. Install: sudo apt install aircrack-ng")
+            return {}, {}
+
+        section("WiFi SCANNER")
+        info(f"Scanning {self.iface} for {duration}s via airodump-ng...")
+        info("Ctrl+C to stop early.\n")
+
+        # Verify monitor interface alive
+        if self.monitor and not self.monitor.interface_alive():
+            warn("Monitor interface not alive — attempting recovery...")
+            self.monitor.recover_interface()
+            self.iface = self.monitor.mon_iface
+
+        if not self.start():
+            return {}, {}
+
+        try:
+            for _ in range(duration):
+                if not self.running:
+                    break
+                time.sleep(1)
         except KeyboardInterrupt:
             pass
 
-        stop_flag.set()
+        self.stop()
         self._show_results()
         return self.networks, self.clients
 
@@ -509,27 +662,27 @@ class WiFiScanner:
 
         table = Table(
             box=box.SIMPLE_HEAD, border_style=C_RUST,
-            header_style=f"bold {C_BLOOD}", padding=(0,1)
+            header_style=f"bold {C_BLOOD}", padding=(0, 1)
         )
         table.add_column("#",       style=C_DIM,    width=4)
-        table.add_column("SSID",    style=C_WHITE,  width=28)
+        table.add_column("SSID",    style=C_WHITE,  width=26)
         table.add_column("BSSID",   style=C_STEEL,  width=18)
         table.add_column("CH",      style=C_DIM,    width=4)
-        table.add_column("CRYPTO",  style=C_EMBER,  width=10)
+        table.add_column("ENC",     style=C_EMBER,  width=6)
         table.add_column("SIGNAL",  style=C_ASH,    width=8)
         table.add_column("CLIENTS", style=C_YELLOW, width=8)
 
         for i, (bssid, net) in enumerate(self.networks.items()):
-            crypto = "/".join(sorted(net["crypto"]))
-            color  = C_BLOOD if "WPA2" in net["crypto"] or "WPA" in net["crypto"] \
-                     else C_ORANGE if "WEP" in net["crypto"] else C_GOOD
+            enc   = net["encryption"]
+            color = C_BLOOD if enc in ("WPA2","WPA") else \
+                    C_ORANGE if enc == "WEP" else C_GOOD
             table.add_row(
-                str(i+1),
-                net["ssid"][:27],
+                str(i + 1),
+                net["ssid"][:25],
                 bssid,
                 str(net["channel"]),
-                f"[{color}]{crypto}[/{color}]",
-                f"{net['signal']}dBm",
+                f"[{color}]{enc}[/{color}]",
+                f"{net['signal']} dBm",
                 str(len(net["clients"]))
             )
 
@@ -538,6 +691,8 @@ class WiFiScanner:
             f"\n  [{C_STEEL}]{len(self.networks)} network(s)  "
             f"{len(self.clients)} client(s)[/{C_STEEL}]"
         )
+
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -552,13 +707,14 @@ class DeauthAttack:
     """
 
     def __init__(self, mon_iface, bssid, client="ff:ff:ff:ff:ff:ff",
-                 channel=1, count=64, interval=0.1):
+                 channel=1, count=64, interval=0.1, monitor_instance=None):
         self.iface    = mon_iface
         self.bssid    = bssid
-        self.client   = client   # ff:ff:ff:ff:ff:ff = broadcast (all clients)
+        self.client   = client
         self.channel  = channel
-        self.count    = count    # packets to send (0 = continuous)
+        self.count    = count
         self.interval = interval
+        self.monitor  = monitor_instance  # MonitorMode for watchdog
 
     def _build_frame(self, src, dst, bssid):
         return (
@@ -585,10 +741,8 @@ class DeauthAttack:
             padding=(1,2)
         ))
 
-        # Set channel
         _run(["iw", self.iface, "set", "channel", str(self.channel)])
 
-        # Build both directions (AP→Client and Client→AP)
         frame_ap_to_client = self._build_frame(self.bssid, self.client, self.bssid)
         frame_client_to_ap = self._build_frame(self.client, self.bssid, self.bssid)
 
@@ -597,10 +751,16 @@ class DeauthAttack:
 
         try:
             while not stop_flag.is_set():
-                sendp(frame_ap_to_client, iface=self.iface,
-                      verbose=False, count=1)
-                sendp(frame_client_to_ap, iface=self.iface,
-                      verbose=False, count=1)
+                # Watchdog — recover if interface crashed
+                if self.monitor and sent % 50 == 0 and sent > 0:
+                    if not self.monitor.interface_alive():
+                        warn("Interface crashed during deauth — recovering...")
+                        self.monitor.recover_interface()
+                        self.iface = self.monitor.mon_iface
+                        _run(["iw", self.iface, "set", "channel", str(self.channel)])
+
+                sendp(frame_ap_to_client, iface=self.iface, verbose=False, count=1)
+                sendp(frame_client_to_ap, iface=self.iface, verbose=False, count=1)
                 sent += 2
 
                 if sent % 20 == 0:
@@ -1199,14 +1359,17 @@ def wifi_menu():
 
         # All other actions use selected_iface
         iface = selected_iface
+        # Get active MonitorMode instance for watchdog (if monitor mode is on)
+        active_mon = MonitorMode._active.get(
+            next((k for k,v in MonitorMode._active.items()
+                  if v.mon_iface == iface), None)
+        )
 
         try:
             if choice == "1":
                 mon = MonitorMode(iface)
                 mon_iface = mon.enable()
-                # Instance stored in MonitorMode._active registry for safe restore
                 ok(f"Monitor interface: {mon_iface}")
-                # Update selected_iface to the monitor interface name
                 selected_iface = mon_iface
                 info("Use option [7] to restore managed mode when done.")
 
@@ -1215,7 +1378,7 @@ def wifi_menu():
                     f"  [{C_STEEL}]Scan duration seconds[/{C_STEEL}]",
                     default="30"
                 ))
-                scanner = WiFiScanner(iface)
+                scanner = WiFiScanner(iface, monitor_instance=active_mon)
                 scanner.scan(duration)
 
             elif choice == "3":
@@ -1270,93 +1433,6 @@ def wifi_menu():
                     orig = list(MonitorMode._active.keys())
                     if orig:
                         selected_iface = orig[0]
-                else:
-                    warn(f"No tracked monitor instance. Attempting direct restore of {iface}...")
-                    mon = MonitorMode(iface)
-                    mon.mon_iface = iface
-                    mon._iw_restore(iface)
-                    _run(["systemctl", "start", "NetworkManager"])
-                    ok("Attempted restore — verify with: iw dev")
-
-            else:
-                console.print(f"  [{C_ORANGE}]Invalid option.[/{C_ORANGE}]")
-
-        except KeyboardInterrupt:
-            stop_flag.set()
-            console.print(f"\n  [{C_ORANGE}]Interrupted.[/{C_ORANGE}]")
-            # Always restore monitor mode on Ctrl+C
-            if MonitorMode._active:
-                warn("Restoring monitor mode interfaces...")
-                MonitorMode.disable_all()
-            stop_flag.clear()
-        except Exception as ex:
-            err(f"Error: {ex}")
-            import traceback; traceback.print_exc()
-
-        try:
-            if choice == "1":
-                mon = MonitorMode(iface)
-                mon_iface = mon.enable()
-                # Instance stored in MonitorMode._active registry for safe restore
-                ok(f"Monitor interface: {mon_iface}")
-                info("Use option [7] to restore managed mode when done.")
-
-            elif choice == "2":
-                duration = int(Prompt.ask(
-                    f"  [{C_STEEL}]Scan duration seconds[/{C_STEEL}]",
-                    default="30"
-                ))
-                scanner = WiFiScanner(iface)
-                scanner.scan(duration)
-
-            elif choice == "3":
-                bssid = Prompt.ask(f"  [{C_BLOOD}]Target AP BSSID[/{C_BLOOD}]")
-                client = Prompt.ask(
-                    f"  [{C_STEEL}]Client MAC [{C_DIM}]Enter for broadcast all[/{C_DIM}][/{C_STEEL}]",
-                    default="ff:ff:ff:ff:ff:ff"
-                )
-                channel = int(Prompt.ask(
-                    f"  [{C_STEEL}]Channel[/{C_STEEL}]", default="6"
-                ))
-                count = int(Prompt.ask(
-                    f"  [{C_STEEL}]Packet count [{C_DIM}]0=continuous[/{C_DIM}][/{C_STEEL}]",
-                    default="64"
-                ))
-                deauth = DeauthAttack(iface, bssid, client, channel, count)
-                deauth.attack()
-
-            elif choice == "4":
-                bssid   = Prompt.ask(f"  [{C_BLOOD}]Target AP BSSID[/{C_BLOOD}]")
-                ssid    = Prompt.ask(f"  [{C_STEEL}]SSID (optional)[/{C_STEEL}]", default="")
-                channel = int(Prompt.ask(f"  [{C_STEEL}]Channel[/{C_STEEL}]", default="6"))
-                timeout = int(Prompt.ask(f"  [{C_STEEL}]Timeout seconds[/{C_STEEL}]", default="60"))
-                auto_d  = Confirm.ask(f"  [{C_STEEL}]Auto-deauth to force reconnect?[/{C_STEEL}]", default=True)
-                cap = HandshakeCapture(iface, bssid, ssid, channel, auto_deauth=auto_d)
-                cap.capture(timeout)
-
-            elif choice == "5":
-                bssid   = Prompt.ask(f"  [{C_BLOOD}]Target AP BSSID[/{C_BLOOD}]")
-                channel = int(Prompt.ask(f"  [{C_STEEL}]Channel[/{C_STEEL}]", default="6"))
-                timeout = int(Prompt.ask(f"  [{C_STEEL}]Timeout seconds[/{C_STEEL}]", default="30"))
-                pmkid = PMKIDAttack(iface, bssid, channel)
-                pmkid.attack(timeout)
-
-            elif choice == "6":
-                ssid    = Prompt.ask(f"  [{C_BLOOD}]SSID to broadcast[/{C_BLOOD}]")
-                channel = int(Prompt.ask(f"  [{C_STEEL}]Channel[/{C_STEEL}]", default="6"))
-                gateway = Prompt.ask(f"  [{C_STEEL}]Gateway IP[/{C_STEEL}]", default="10.0.0.1")
-                inet    = Prompt.ask(
-                    f"  [{C_STEEL}]Internet interface [{C_DIM}]blank=none[/{C_DIM}][/{C_STEEL}]",
-                    default=""
-                )
-                ap = EvilTwinAP(iface, ssid, channel, gateway,
-                                internet_iface=inet or None)
-                ap.start()
-
-            elif choice == "7":
-                # Use class registry for safe restore
-                if MonitorMode._active:
-                    MonitorMode.disable_all()
                 else:
                     warn(f"No tracked monitor instance. Attempting direct restore of {iface}...")
                     mon = MonitorMode(iface)

@@ -583,13 +583,23 @@ class KTOxREPL(cmd.Cmd):
             return
         table = Table(box=box.SIMPLE, border_style=C_RUST,
                       header_style=f"bold {C_BLOOD}", padding=(0,1))
-        table.add_column("#",    style=C_DIM,   width=4)
-        table.add_column("IP",   style=C_WHITE, width=16)
-        table.add_column("MAC",  style=C_STEEL, width=18)
+        table.add_column("#",        style=C_DIM,   width=4)
+        table.add_column("IP",       style=C_WHITE, width=16)
+        table.add_column("MAC",      style=C_STEEL, width=18)
+        table.add_column("VENDOR",   style=C_DIM,   width=14)
+        table.add_column("HOSTNAME", style=C_DIM,   width=16)
         for i, h in enumerate(self.session.hosts):
-            ip  = h[0] if isinstance(h, (list,tuple)) else h.get("ip","?")
-            mac = h[1] if isinstance(h, (list,tuple)) else h.get("mac","?")
-            table.add_row(str(i), ip, mac)
+            if isinstance(h, (list, tuple)):
+                ip       = h[0] if len(h) > 0 else "?"
+                mac      = h[1] if len(h) > 1 else ""
+                vendor   = h[2] if len(h) > 2 else ""
+                hostname = h[3] if len(h) > 3 else ""
+            else:
+                ip       = h.get("ip", "?")
+                mac      = h.get("mac", "")
+                vendor   = h.get("vendor", "")
+                hostname = h.get("hostname", "")
+            table.add_row(str(i), ip, mac, vendor or "—", hostname or "—")
         console.print(table)
 
     def do_loot(self, line):
