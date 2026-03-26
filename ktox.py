@@ -386,9 +386,18 @@ def do_scan():
         prog.add_task("scan")
         raw = scan.scanNetwork(get_default_interface(True))
 
-    # Enrich immediately with vendor (OUI lookup is instant, no network needed)
-    # hosts_list format: [ip, mac, vendor, hostname]
-    hosts_list = [[ip, mac, resolve_vendor(mac), ""] for ip, mac in raw]
+    # scan.py now returns [ip, mac, vendor, hostname] directly from nmap
+    # Fall back to local OUI table if nmap didn't resolve vendor
+    hosts_list = []
+    for entry in raw:
+        ip       = entry[0]
+        mac      = entry[1] if len(entry) > 1 else ""
+        vendor   = entry[2] if len(entry) > 2 else ""
+        hostname = entry[3] if len(entry) > 3 else ""
+        if not vendor and mac:
+            vendor = resolve_vendor(mac)
+        hosts_list.append([ip, mac, vendor, hostname])
+
     online_ips = [h[0] for h in hosts_list]
     log("SCAN_COMPLETE", hosts=online_ips, count=len(hosts_list))
 
@@ -406,7 +415,7 @@ def do_scan():
                 shutdown()
             gateway_mac_set = True
 
-    # Resolve hostnames in background — non-blocking, updates hosts_list in place
+    # Async fill-in for any hostnames nmap didn't resolve
     def _bg_resolve():
         for h in hosts_list:
             if not h[3]:

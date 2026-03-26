@@ -848,12 +848,19 @@ class KTOxApp(ctk.CTk):
             raw = scan.scanNetwork(_get_interface(True))
             default_gateway_mac = None
 
-            # Build hosts_list with vendor immediately (OUI lookup is instant),
-            # then kick off async hostname resolution per-host
+            # scan.py now returns [ip, mac, vendor, hostname]
+            # vendor and hostname come from nmap directly — no re-resolution needed
             enriched = []
-            for ip, mac in raw:
-                vendor = _resolve_vendor(mac)
-                enriched.append([ip, mac, vendor, "…"])  # hostname placeholder
+            for entry in raw:
+                ip       = entry[0]
+                mac      = entry[1] if len(entry) > 1 else ""
+                vendor   = entry[2] if len(entry) > 2 else ""
+                hostname = entry[3] if len(entry) > 3 else ""
+                # If nmap didn't get vendor, try our local OUI table as fallback
+                if not vendor and mac:
+                    vendor = _resolve_vendor(mac)
+                enriched.append([ip, mac, vendor, hostname])
+
             hosts_list = enriched
 
             for h in hosts_list:
@@ -867,23 +874,24 @@ class KTOxApp(ctk.CTk):
             self.after(0, self._fill_tree)
             _log_event("SCAN_COMPLETE", count=len(hosts_list))
 
-            # Resolve hostnames async — updates each row as results come in
-            def _resolve_hostnames():
+            # For any hosts where hostname is still empty, try async DNS resolve
+            def _resolve_remaining():
                 for idx, h in enumerate(hosts_list):
-                    name = _resolve_hostname(h[0])
-                    hosts_list[idx][3] = name
-                    # Update tree row live
-                    def _update(i=idx, n=name):
-                        try:
-                            children = self._tree.get_children()
-                            if i < len(children):
-                                vals = list(self._tree.item(children[i], "values"))
-                                if len(vals) >= 5:
-                                    vals[4] = n
-                                    self._tree.item(children[i], values=vals)
-                        except: pass
-                    self.after(0, _update)
-            threading.Thread(target=_resolve_hostnames, daemon=True).start()
+                    if not h[3]:  # hostname still empty
+                        name = _resolve_hostname(h[0])
+                        if name and name != "—":
+                            hosts_list[idx][3] = name
+                            def _update(i=idx, n=name):
+                                try:
+                                    children = self._tree.get_children()
+                                    if i < len(children):
+                                        vals = list(self._tree.item(children[i], "values"))
+                                        if len(vals) >= 5:
+                                            vals[4] = n
+                                            self._tree.item(children[i], values=vals)
+                                except: pass
+                            self.after(0, _update)
+            threading.Thread(target=_resolve_remaining, daemon=True).start()
 
         except Exception as ex:
             self._log(f"Scan error: {ex}", "red")
