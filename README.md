@@ -39,7 +39,7 @@
 
 - **50+ attack, recon, and defensive modules** across 7 engine files
 - **Blood-red terminal TUI** powered by Rich
-- **Cyberpunk CustomTkinter desktop GUI** — adaptive, screen-aware
+- **Matching CustomTkinter desktop GUI** — adaptive, screen-aware
 - **Live web dashboard** — browser UI updating every 1.5 seconds
 - **Caplet automation engine** — script attack sequences in `.ktox` files
 - **IoT fingerprinter** — 5-layer device identification
