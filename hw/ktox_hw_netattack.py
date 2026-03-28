@@ -19,7 +19,7 @@ from ktox_hw_utils import (
     clear_buf, draw_header, draw_status, draw_menu, draw_centered,
     draw_running, draw_result,
     read_btn, wait_for_btn,
-    scan_and_pick, get_iface_and_gateway, get_network_cidr,
+    scan_and_pick, get_iface_and_gateway, get_network_cidr, resolve_mac,
     install_signal_handlers, make_logger, loot_dir,
     C, FONT_TITLE, FONT_MENU, FONT_SMALL, LCD_W, LCD_H,
 )
@@ -82,26 +82,21 @@ def _wait_stop(stop_event, title, subtitle="", pkt_ref=None):
 
 def op_icmp_redirect(n, iface, gw_ip, target_ip):
     """ICMP redirect MITM — stealthy, bypasses DAI/ARP inspection."""
-    import socket
-    my_ip = socket.gethostbyname(socket.gethostname()) or gw_ip
+    # Resolve gateway MAC for spoofed packets
+    gw_mac = resolve_mac(gw_ip) or "ff:ff:ff:ff:ff:ff"
 
-    stop  = threading.Event()
-    pkts  = [0]
+    stop = threading.Event()
     try:
-        attack = n.ICMPRedirectAttack(
-            iface=iface, gateway_ip=gw_ip,
-            target_ip=target_ip, attacker_ip=my_ip,
-            pkt_ref=pkts,
-        )
+        attack = n.ICMPRedirectAttack(iface, gw_ip, gw_mac, target_ip)
         t = threading.Thread(target=attack.start, daemon=True)
         t.start()
         log(f"ICMP_REDIRECT_START target={target_ip}")
-        _wait_stop(stop, "ICMP REDIR", subtitle=target_ip, pkt_ref=pkts)
+        _wait_stop(stop, "ICMP REDIR", subtitle=target_ip)
         attack.stop()
         t.join(timeout=3)
-        log(f"ICMP_REDIRECT_STOP pkts={pkts[0]}")
+        log("ICMP_REDIRECT_STOP")
         draw_result(DRAW, "REDIR DONE",
-                    [f"target: {target_ip}", f"pkts: {pkts[0]}"], color=C["GOOD"])
+                    [f"target: {target_ip}", "routing restored"], color=C["GOOD"])
     except Exception as e:
         log(f"icmp_redirect error: {e}")
         draw_result(DRAW, "REDIR ERR", [str(e)[:20]], color=C["BLOOD"])
@@ -111,22 +106,18 @@ def op_icmp_redirect(n, iface, gw_ip, target_ip):
 
 def op_ndp_spoof(n, iface, target_ip6, gw_ip6):
     """IPv6 Neighbor Discovery poisoning (IPv6 ARP equivalent)."""
-    stop  = threading.Event()
-    pkts  = [0]
+    stop = threading.Event()
     try:
-        spoofer = n.NDPSpoofer(
-            iface=iface, target_ipv6=target_ip6,
-            gateway_ipv6=gw_ip6, pkt_ref=pkts,
-        )
+        spoofer = n.NDPSpoofer(iface, target_ip6, gw_ip6)
         t = threading.Thread(target=spoofer.start, daemon=True)
         t.start()
         log(f"NDP_SPOOF_START target={target_ip6}")
-        _wait_stop(stop, "NDP SPOOF", subtitle=target_ip6[:15], pkt_ref=pkts)
+        _wait_stop(stop, "NDP SPOOF", subtitle=target_ip6[:15])
         spoofer.stop()
         t.join(timeout=3)
-        log(f"NDP_SPOOF_STOP pkts={pkts[0]}")
+        log("NDP_SPOOF_STOP")
         draw_result(DRAW, "NDP DONE",
-                    [target_ip6[:18], f"pkts: {pkts[0]}"], color=C["GOOD"])
+                    [target_ip6[:18], "stopped"], color=C["GOOD"])
     except Exception as e:
         log(f"ndp_spoof error: {e}")
         draw_result(DRAW, "NDP ERR", [str(e)[:20]], color=C["BLOOD"])
@@ -134,11 +125,28 @@ def op_ndp_spoof(n, iface, target_ip6, gw_ip6):
     wait_for_btn(["KEY3", "LEFT", "OK"])
 
 
+def _get_local_ipv6(iface):
+    """Get the link-local IPv6 address for an interface."""
+    try:
+        out = subprocess.check_output(
+            ["ip", "-6", "addr", "show", iface, "scope", "link"],
+            text=True, timeout=3
+        )
+        import re as _re
+        m = _re.search(r'inet6\s+(fe80[:\w]+)/\d+', out)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return "fe80::1"
+
+
 def op_dhcpv6_spoof(n, iface):
     """Rogue DHCPv6 server."""
+    attacker_ipv6 = _get_local_ipv6(iface)
     stop = threading.Event()
     try:
-        server = n.DHCPv6Spoofer(iface=iface)
+        server = n.DHCPv6Spoofer(iface, attacker_ipv6)
         t      = threading.Thread(target=server.start, daemon=True)
         t.start()
         log("DHCPv6_START")
@@ -157,18 +165,16 @@ def op_dhcpv6_spoof(n, iface):
 def op_ra_flood(n, iface):
     """Rogue Router Advertisement flood — random prefix DoS."""
     stop = threading.Event()
-    pkts = [0]
     try:
-        flood = n.RAFlood(iface=iface, pkt_ref=pkts)
+        flood = n.RAFlood(iface)
         t     = threading.Thread(target=flood.start, daemon=True)
         t.start()
         log("RA_FLOOD_START")
-        _wait_stop(stop, "RA FLOOD", subtitle="IPv6 RA", pkt_ref=pkts)
+        _wait_stop(stop, "RA FLOOD", subtitle="IPv6 RA")
         flood.stop()
         t.join(timeout=3)
-        log(f"RA_FLOOD_STOP pkts={pkts[0]}")
-        draw_result(DRAW, "RA DONE",
-                    [f"pkts: {pkts[0]}"], color=C["GOOD"])
+        log("RA_FLOOD_STOP")
+        draw_result(DRAW, "RA DONE", ["RA flood stopped"], color=C["GOOD"])
     except Exception as e:
         log(f"ra_flood error: {e}")
         draw_result(DRAW, "RA ERR", [str(e)[:20]], color=C["BLOOD"])
@@ -183,14 +189,15 @@ def op_ipv6_scan(n, iface):
     draw_centered(DRAW, "sending NS...", 50, FONT_MENU, fill=C["STEEL"])
     push(LCD, IMAGE)
 
-    hosts = []
+    hosts_dict = {}
     try:
-        scanner = n.IPv6Scanner(iface=iface)
-        hosts   = scanner.scan(timeout=15)
-        log(f"IPv6_SCAN_DONE hosts={len(hosts)}")
+        scanner = n.IPv6Scanner(iface)
+        hosts_dict, _ = scanner.scan(duration=15)  # returns (hosts_dict, routers_dict)
+        log(f"IPv6_SCAN_DONE hosts={len(hosts_dict)}")
     except Exception as e:
         log(f"ipv6_scan error: {e}")
 
+    hosts = list(hosts_dict.keys()) if hosts_dict else []
     if not hosts:
         draw_result(DRAW, "IPv6 SCAN", ["no IPv6 hosts found"], color=C["ORANGE"])
         push(LCD, IMAGE)

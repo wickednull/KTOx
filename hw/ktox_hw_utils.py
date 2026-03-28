@@ -443,15 +443,43 @@ def scan_and_pick(lcd, image, draw, iface, network,
 
     Returns chosen host entry [ip, mac, vendor, hostname] or None if cancelled.
     """
-    # ── scanning screen ──────────────────────────────────────────────────────
-    clear_buf(draw)
-    draw_header(draw, "KTOx", color=C["BLOOD"])
-    draw_centered(draw, "SCANNING...", 40, FONT_MENU, fill=C["STEEL"])
-    draw_centered(draw, network or iface, 58, FONT_SMALL, fill=C["DIM"])
-    draw_status(draw, "please wait", color=C["DIM"])
-    push(lcd, image)
+    # ── scanning screen — run nmap in background thread so LCD stays alive ──
+    hosts     = []
+    cancelled = threading.Event()
+    scan_done = threading.Event()
 
-    hosts = do_scan_hw(network or iface)
+    def _bg_scan():
+        try:
+            result = do_scan_hw(network or iface)
+            if not cancelled.is_set():
+                hosts.extend(result)
+        except Exception:
+            pass
+        finally:
+            scan_done.set()
+
+    threading.Thread(target=_bg_scan, daemon=True).start()
+
+    dots   = 0
+    last_t = 0.0
+    while not scan_done.is_set():
+        dots = (dots + 1) % 4
+        clear_buf(draw)
+        draw_header(draw, "KTOx", color=C["BLOOD"])
+        draw_centered(draw, "SCANNING" + "." * dots, 38, FONT_MENU, fill=C["STEEL"])
+        draw_centered(draw, (network or iface or "")[:20], 55, FONT_SMALL, fill=C["DIM"])
+        draw_status(draw, "KEY3: cancel", color=C["DIM"])
+        push(lcd, image)
+        btn, last_t = read_btn(last_t)
+        if btn in ("KEY3", "LEFT"):
+            cancelled.set()
+            scan_done.set()
+            break
+        time.sleep(0.3)
+
+    if cancelled.is_set():
+        return None
+
     if not hosts:
         clear_buf(draw)
         draw_header(draw, "KTOx", color=C["BLOOD"])

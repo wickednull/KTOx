@@ -123,16 +123,13 @@ def op_js_inject(a, iface, attacker_ip):
         time.sleep(0.05)
 
     stop = threading.Event()
-    pkts = [0]
+    a.stop_flag.clear()
     try:
-        injector = a.JSInjector(iface=iface, payload_type=payload,
-                                attacker_ip=attacker_ip)
-        t = threading.Thread(target=injector.start, daemon=True)
-        t.start()
+        injector = a.JSInjector(attacker_ip, payload_name=payload)
+        injector.start()  # non-blocking, starts internal threads
         log(f"JS_INJECT_START payload={payload}")
-        _wait_stop(stop, "JS INJECT", subtitle=payload, pkt_ref=pkts)
-        injector.stop()
-        t.join(timeout=3)
+        _wait_stop(stop, "JS INJECT", subtitle=payload)
+        a.stop_flag.set()
         log("JS_INJECT_STOP")
         draw_result(DRAW, "JS DONE", [f"Payload: {payload}", "Stopped"], color=C["GOOD"])
     except Exception as e:
@@ -144,17 +141,12 @@ def op_js_inject(a, iface, attacker_ip):
 
 def op_proto_sniff(a, iface):
     """Multi-protocol credential sniffer."""
-    stop  = threading.Event()
-    pkts  = [0]
-    creds = []
+    stop = threading.Event()
+    a.stop_flag.clear()
 
     try:
-        sniffer = a.MultiProtocolSniffer(
-            iface=iface,
-            loot_callback=lambda c: creds.append(c),
-        )
-        t = threading.Thread(target=sniffer.start, daemon=True)
-        t.start()
+        sniffer = a.MultiProtocolSniffer(iface)
+        sniffer.start()  # non-blocking, starts internal thread
         log("PROTO_SNIFF_START")
 
         last_t  = 0.0
@@ -164,18 +156,17 @@ def op_proto_sniff(a, iface):
             elapsed = int(time.time() - t_start)
             clear_buf(DRAW)
             draw_running(DRAW, "PROTO SNIFF",
-                         line1=f"{len(creds)} creds", elapsed=elapsed)
+                         line1="sniffing creds", elapsed=elapsed)
             push(LCD, IMAGE)
             btn, last_t = read_btn(last_t)
             if btn in ("KEY3", "LEFT"):
                 stop.set()
             time.sleep(0.15)
 
-        sniffer.stop()
-        t.join(timeout=3)
-        log(f"PROTO_SNIFF_STOP creds={len(creds)}")
+        a.stop_flag.set()
+        log("PROTO_SNIFF_STOP")
         draw_result(DRAW, "SNIFF DONE",
-                    [f"{len(creds)} creds captured", "saved to loot"],
+                    ["creds saved to loot"],
                     color=C["GOOD"])
     except Exception as e:
         log(f"proto_sniff error: {e}")
@@ -189,16 +180,14 @@ def op_pcap(a, iface):
     import datetime
     outfile = os.path.join(loot_dir(),
                            f"capture_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pcap")
-    stop  = threading.Event()
-    pkts  = [0]
+    stop = threading.Event()
+    a.stop_flag.clear()
     try:
-        capture = a.PCAPCapture(iface=iface, output_file=outfile)
-        t = threading.Thread(target=capture.start, daemon=True)
-        t.start()
+        capture = a.PCAPCapture(iface, filename=outfile)
+        capture.start()  # non-blocking, starts internal thread
         log(f"PCAP_START file={outfile}")
-        _wait_stop(stop, "PCAP", subtitle=os.path.basename(outfile), pkt_ref=pkts)
+        _wait_stop(stop, "PCAP", subtitle=os.path.basename(outfile))
         capture.stop()
-        t.join(timeout=3)
         size_kb = os.path.getsize(outfile) // 1024 if os.path.isfile(outfile) else 0
         log(f"PCAP_STOP size={size_kb}KB")
         draw_result(DRAW, "PCAP DONE",
@@ -211,17 +200,13 @@ def op_pcap(a, iface):
     wait_for_btn(["KEY3", "LEFT", "OK"])
 
 
-def op_ntlm(a, iface):
+def op_ntlm(a, iface, attacker_ip):
     """NTLMv2 hash capture from HTTP + SMB traffic."""
-    stop  = threading.Event()
-    hashes = []
+    stop = threading.Event()
+    a.stop_flag.clear()
     try:
-        capture = a.NTLMCapture(
-            iface=iface,
-            loot_callback=lambda h: hashes.append(h),
-        )
-        t = threading.Thread(target=capture.start, daemon=True)
-        t.start()
+        capture = a.NTLMCapture(iface, attacker_ip)
+        capture.start()  # non-blocking, starts internal thread
         log("NTLM_START")
 
         last_t  = 0.0
@@ -231,18 +216,17 @@ def op_ntlm(a, iface):
             elapsed = int(time.time() - t_start)
             clear_buf(DRAW)
             draw_running(DRAW, "NTLM CAPTURE",
-                         line1=f"{len(hashes)} hashes", elapsed=elapsed)
+                         line1="capturing hashes", elapsed=elapsed)
             push(LCD, IMAGE)
             btn, last_t = read_btn(last_t)
             if btn in ("KEY3", "LEFT"):
                 stop.set()
             time.sleep(0.15)
 
-        capture.stop()
-        t.join(timeout=3)
-        log(f"NTLM_STOP hashes={len(hashes)}")
+        a.stop_flag.set()
+        log("NTLM_STOP")
         draw_result(DRAW, "NTLM DONE",
-                    [f"{len(hashes)} hashes", "saved to loot"],
+                    ["hashes saved to loot"],
                     color=C["GOOD"])
     except Exception as e:
         log(f"ntlm error: {e}")
@@ -254,14 +238,10 @@ def op_ntlm(a, iface):
 def op_session_hijack(a, iface):
     """Cookie theft + curl replay script generation."""
     stop    = threading.Event()
-    sessions = []
+    a.stop_flag.clear()
     try:
-        hijacker = a.SessionHijacker(
-            iface=iface,
-            loot_callback=lambda s: sessions.append(s),
-        )
-        t = threading.Thread(target=hijacker.start, daemon=True)
-        t.start()
+        hijacker = a.SessionHijacker(iface)
+        hijacker.start()  # non-blocking, starts internal thread
         log("SESSION_HIJACK_START")
 
         last_t  = 0.0
@@ -269,20 +249,20 @@ def op_session_hijack(a, iface):
         t_start = time.time()
         while not stop.is_set():
             elapsed = int(time.time() - t_start)
+            n_sess  = len(hijacker._sessions)
             clear_buf(DRAW)
             draw_running(DRAW, "SESS HIJACK",
-                         line1=f"{len(sessions)} cookies", elapsed=elapsed)
+                         line1=f"{n_sess} cookies", elapsed=elapsed)
             push(LCD, IMAGE)
             btn, last_t = read_btn(last_t)
             if btn in ("KEY3", "LEFT"):
                 stop.set()
             time.sleep(0.15)
 
-        hijacker.stop()
-        t.join(timeout=3)
-        log(f"SESSION_HIJACK_STOP sessions={len(sessions)}")
+        a.stop_flag.set()
+        log("SESSION_HIJACK_STOP")
         draw_result(DRAW, "HIJACK DONE",
-                    [f"{len(sessions)} cookies", "curl scripts saved"],
+                    ["curl scripts saved to loot"],
                     color=C["GOOD"])
     except Exception as e:
         log(f"session_hijack error: {e}")
@@ -333,18 +313,15 @@ def op_caplet(a, iface, attacker_ip, gw_ip):
             return
         time.sleep(0.05)
 
+    ctx = {"iface": iface, "attacker_ip": attacker_ip, "gateway_ip": gw_ip}
     stop = threading.Event()
     try:
-        engine = a.CapletEngine(
-            iface=iface, attacker_ip=attacker_ip, gateway_ip=gw_ip
-        )
-        t = threading.Thread(
-            target=engine.run_file, args=(caplet_path,), daemon=True
-        )
+        engine = a.CapletEngine(caplet_path, env=ctx)
+        t = threading.Thread(target=engine.run, args=(ctx,), daemon=True)
         t.start()
         log(f"CAPLET_START file={caplets[sel]}")
         _wait_stop(stop, "CAPLET", subtitle=caplets[sel][:16])
-        engine.stop()
+        a.stop_flag.set()
         t.join(timeout=5)
         log("CAPLET_STOP")
         draw_result(DRAW, "CAPLET DONE", [caplets[sel][:18], "Complete"], color=C["GOOD"])
@@ -409,7 +386,7 @@ def main():
             elif choice == "PCAP CAPTURE":
                 op_pcap(a, iface)
             elif choice == "NTLM CAPTURE":
-                op_ntlm(a, iface)
+                op_ntlm(a, iface, attacker_ip)
             elif choice == "SESSION HIJACK":
                 op_session_hijack(a, iface)
             elif choice == "CAPLET RUNNER":

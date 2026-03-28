@@ -42,13 +42,6 @@ MENU_COLORS = [
     C["ASH"], C["DIM"], C["STEEL"], C["ASH"], C["ORANGE"], C["DIM"],
 ]
 
-# Stealth profile definitions (ppm, jitter_min, jitter_max, mac_rotate_min)
-PROFILES = {
-    "GHOST":  (6,   3.0,  12.0, 5),
-    "NINJA":  (30,  0.5,   3.0, 10),
-    "NORMAL": (120, 0.05,  0.3, 0),
-}
-
 
 def cleanup(*_):
     global RUNNING
@@ -206,47 +199,28 @@ def op_fingerprint(s, iface, network, gw_ip):
 def op_stealth(s, iface, profile_name, custom=False):
     """Activate a stealth profile for rate limiting + MAC rotation."""
     if custom:
-        # Show a simple confirmation screen for now — full custom would need
-        # a number-entry widget beyond the 128px display
-        ppm      = 30
-        jitter   = 1.0
-        mac_min  = 5
         clear_buf(DRAW)
         draw_header(DRAW, "CUSTOM", color=C["ORANGE"])
-        draw_centered(DRAW, "ppm:  30",   30, FONT_MENU, fill=C["WHITE"])
+        draw_centered(DRAW, "ppm:  60",   30, FONT_MENU, fill=C["WHITE"])
         draw_centered(DRAW, "jitter: 1s", 46, FONT_MENU, fill=C["WHITE"])
-        draw_centered(DRAW, "MAC: 5min",  62, FONT_MENU, fill=C["WHITE"])
+        draw_centered(DRAW, "MAC: off",   62, FONT_MENU, fill=C["WHITE"])
         draw_status(DRAW, "OK:START KEY3:BACK", color=C["DIM"])
         push(LCD, IMAGE)
         btn = wait_for_btn(["OK", "KEY_PRESS", "KEY3", "LEFT"])
         if btn in ("KEY3", "LEFT"):
             return
-    else:
-        ppm, jitter_min, jitter_max, mac_min = PROFILES.get(
-            profile_name, (30, 0.5, 3.0, 10)
-        )
-        jitter = jitter_min
+
+    # Map display name to profile key (StealthMode uses lowercase keys)
+    profile_key = profile_name.lower()  # "GHOST"→"ghost", "NINJA"→"ninja" etc.
 
     stop = threading.Event()
     try:
-        mode = s.StealthMode(
-            iface=iface,
-            ppm=ppm,
-            jitter=jitter,
-            mac_rotate_min=mac_min,
-        )
-        t = threading.Thread(target=mode.start, daemon=True)
-        t.start()
-        log(f"STEALTH_START profile={profile_name} ppm={ppm}")
-        _wait_stop(stop, f"STEALTH", subtitle=profile_name)
+        mode = s.StealthMode(iface, profile=profile_key)
+        mode.start()  # non-blocking — launches background threads
+        log(f"STEALTH_START profile={profile_key}")
+        _wait_stop(stop, "STEALTH", subtitle=profile_name)
         mode.stop()
-        t.join(timeout=3)
-        log(f"STEALTH_STOP profile={profile_name}")
-
-        # Restore MAC if rotated
-        if mac_min > 0 and hasattr(mode, "restore_mac"):
-            mode.restore_mac()
-
+        log(f"STEALTH_STOP profile={profile_key}")
         draw_result(DRAW, "STEALTH OFF",
                     [f"Profile: {profile_name}", "MAC restored"], color=C["GOOD"])
     except Exception as e:

